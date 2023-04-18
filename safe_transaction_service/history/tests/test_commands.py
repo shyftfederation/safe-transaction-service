@@ -11,8 +11,8 @@ from django_celery_beat.models import PeriodicTask
 
 from gnosis.eth.ethereum_client import EthereumClient, EthereumNetwork
 
-from ..indexers import InternalTxIndexer, SafeEventsIndexer
-from ..models import ProxyFactory, SafeMasterCopy
+from ..indexers import Erc20EventsIndexer, InternalTxIndexer, SafeEventsIndexer
+from ..models import IndexingStatus, ProxyFactory, SafeMasterCopy
 from ..services import IndexServiceProvider
 from ..tasks import logger as task_logger
 from .factories import (
@@ -197,7 +197,7 @@ class TestCommands(TestCase):
                     stdout=buf,
                 )
                 self.assertIn(
-                    f"Start reindexing Safe Master Copy addresses {[safe_master_copy.address]}",
+                    f"Start reindexing addresses {[safe_master_copy.address]}",
                     cm.output[0],
                 )
                 self.assertIn("found 0 traces/events", cm.output[1])
@@ -208,12 +208,12 @@ class TestCommands(TestCase):
                 find_relevant_elements_mock.assert_any_call(
                     [safe_master_copy.address],
                     from_block_number,
-                    from_block_number + block_process_limit,
+                    from_block_number + block_process_limit - 1,
                 )
                 find_relevant_elements_mock.assert_any_call(
                     [safe_master_copy.address],
                     from_block_number + block_process_limit,
-                    from_block_number + block_process_limit * 2,
+                    current_block_number_mock.return_value,
                 )
                 self.assertEqual(find_relevant_elements_mock.call_count, 2)
 
@@ -239,7 +239,7 @@ class TestCommands(TestCase):
                         stdout=buf,
                     )
                     self.assertIn(
-                        f"Start reindexing Safe Master Copy addresses {[safe_l2_master_copy.address]}",
+                        f"Start reindexing addresses {[safe_l2_master_copy.address]}",
                         cm.output[0],
                     )
                     self.assertIn("found 0 traces/events", cm.output[1])
@@ -250,17 +250,90 @@ class TestCommands(TestCase):
                     find_relevant_elements_mock.assert_any_call(
                         [safe_l2_master_copy.address],
                         from_block_number,
-                        from_block_number + block_process_limit,
+                        from_block_number + block_process_limit - 1,
                     )
                     find_relevant_elements_mock.assert_any_call(
                         [safe_l2_master_copy.address],
                         from_block_number + block_process_limit,
-                        from_block_number + block_process_limit * 2,
+                        current_block_number_mock.return_value,
                     )
                     self.assertEqual(find_relevant_elements_mock.call_count, 2)
+        IndexServiceProvider.del_singleton()
+
+    @mock.patch.object(
+        EthereumClient, "current_block_number", new_callable=PropertyMock
+    )
+    def test_reindex_erc20_events(self, current_block_number_mock: PropertyMock):
+        logger_name = "safe_transaction_service.history.services.index_service"
+        current_block_number_mock.return_value = 1000
+        command = "reindex_erc20"
+
+        with self.assertRaisesMessage(
+            CommandError, "the following arguments are required: --from-block-number"
+        ):
+            call_command(command)
+
+        buf = StringIO()
+        with self.assertLogs(logger_name, level="WARNING") as cm:
+            call_command(
+                command,
+                "--block-process-limit=11",
+                "--from-block-number=76",
+                stdout=buf,
+            )
+            self.assertIn("Setting block-process-limit to 11", buf.getvalue())
+            self.assertIn("Setting from-block-number to 76", buf.getvalue())
+            self.assertIn("No addresses to process", cm.output[0])
+
+        safe_contract = SafeContractFactory()
+        buf = StringIO()
+        with self.assertLogs(logger_name, level="INFO") as cm:
+            with mock.patch.object(
+                Erc20EventsIndexer, "find_relevant_elements", return_value=[]
+            ) as find_relevant_elements_mock:
+                IndexServiceProvider.del_singleton()
+                from_block_number = 100
+                block_process_limit = 500
+                call_command(
+                    command,
+                    f"--block-process-limit={block_process_limit}",
+                    f"--from-block-number={from_block_number}",
+                    stdout=buf,
+                )
+                self.assertIn(
+                    f"Start reindexing addresses {[safe_contract.address]}",
+                    cm.output[0],
+                )
+                self.assertIn("found 0 traces/events", cm.output[1])
+                self.assertIn(
+                    f"End reindexing addresses {[safe_contract.address]}",
+                    cm.output[3],
+                )
+                find_relevant_elements_mock.assert_any_call(
+                    [safe_contract.address],
+                    from_block_number,
+                    from_block_number + block_process_limit - 1,
+                )
+                find_relevant_elements_mock.assert_any_call(
+                    [safe_contract.address],
+                    from_block_number + block_process_limit,
+                    current_block_number_mock.return_value,
+                )
+                self.assertEqual(find_relevant_elements_mock.call_count, 2)
+        IndexServiceProvider.del_singleton()
 
     def test_setup_service_mainnet(self):
+        self.assertEqual(
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number, 0
+        )
         self._test_setup_service(EthereumNetwork.MAINNET)
+        first_safe_block_deployed = (
+            6569433  # 0.0.2 deployment block, first Safe contract
+        )
+        self.assertEqual(
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number,
+            first_safe_block_deployed,
+        )
 
         # Check last master copy was created
         last_master_copy_address = "0x6851D6fDFAfD08c0295C392436245E5bc78B0185"
@@ -289,6 +362,23 @@ class TestCommands(TestCase):
         self.assertEqual(SafeMasterCopy.objects.count(), 8)
         self.assertEqual(SafeMasterCopy.objects.l2().count(), 1)
         self.assertEqual(ProxyFactory.objects.count(), 4)
+
+    def test_setup_service_mainnet_erc20_indexing_setup(self):
+        # Test IndexingStatus ERC20 is not modified if higher than the oldest master copy
+        self.assertEqual(
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number, 0
+        )
+        first_safe_block_deployed = (
+            6569433  # 0.0.2 deployment block, first Safe contract
+        )
+        IndexingStatus.objects.set_erc20_721_indexing_status(
+            first_safe_block_deployed + 20
+        )
+        self._test_setup_service(EthereumNetwork.MAINNET)
+        self.assertEqual(
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number,
+            first_safe_block_deployed + 20,
+        )
 
     def test_setup_service_rinkeby(self):
         self._test_setup_service(EthereumNetwork.RINKEBY)
@@ -322,7 +412,33 @@ class TestCommands(TestCase):
             MultisigTransactionFactory(
                 origin="another-something", ethereum_tx=None
             )  # Will not be exported
-            MultisigTransactionFactory(origin=None)  # Will not be exported
+            MultisigTransactionFactory(origin={})  # Will not be exported
             buf = StringIO()
             call_command(command, arguments, stdout=buf)
             self.assertIn("Start exporting of 1", buf.getvalue())
+
+    @mock.patch(
+        "safe_transaction_service.history.management.commands.check_chainid_matches.get_ethereum_network"
+    )
+    def test_check_chainid_matches(self, get_ethereum_network_mock: MagicMock):
+        command = "check_chainid_matches"
+
+        # Create ChainId model
+        get_ethereum_network_mock.return_value = EthereumNetwork.MAINNET
+        buf = StringIO()
+        call_command(command, stdout=buf)
+        self.assertIn("EthereumRPC chainId 1 looks good", buf.getvalue())
+
+        # Use different chainId
+        get_ethereum_network_mock.return_value = EthereumNetwork.GNOSIS
+        with self.assertRaisesMessage(
+            CommandError,
+            "EthereumRPC chainId 100 does not match previously used chainId 1",
+        ):
+            call_command(command)
+
+        # Check again with the initial chainId
+        get_ethereum_network_mock.return_value = EthereumNetwork.MAINNET
+        buf = StringIO()
+        call_command(command, stdout=buf)
+        self.assertIn("EthereumRPC chainId 1 looks good", buf.getvalue())

@@ -87,17 +87,17 @@ class TestSignals(TestCase):
                 webhook_task_mock.assert_called()
                 send_notification_task_mock.assert_called()
 
-        multisig_confirmation.created -= timedelta(minutes=45)
+        multisig_confirmation.created -= timedelta(minutes=75)
         with mock.patch.object(send_webhook_task, "apply_async") as webhook_task_mock:
             with mock.patch.object(
                 send_notification_task, "apply_async"
             ) as send_notification_task_mock:
                 process_webhook(MultisigConfirmation, multisig_confirmation, True)
-                webhook_task_mock.assert_called()
+                webhook_task_mock.assert_not_called()
                 send_notification_task_mock.assert_not_called()
 
     @factory.django.mute_signals(post_save)
-    def test_is_relevant_notification(self):
+    def test_is_relevant_notification_multisig_confirmation(self):
         multisig_confirmation = MultisigConfirmationFactory()
         self.assertFalse(
             is_relevant_notification(
@@ -109,22 +109,30 @@ class TestSignals(TestCase):
                 multisig_confirmation.__class__, multisig_confirmation, created=True
             )
         )
-        multisig_confirmation.created -= timedelta(minutes=45)
+        multisig_confirmation.created -= timedelta(minutes=75)
         self.assertFalse(
             is_relevant_notification(
                 multisig_confirmation.__class__, multisig_confirmation, created=True
             )
         )
 
-        multisig_tx = MultisigTransactionFactory()
+    @factory.django.mute_signals(post_save)
+    def test_is_relevant_notification_multisig_transaction(self):
+        multisig_tx = MultisigTransactionFactory(trusted=False)
+        self.assertFalse(
+            is_relevant_notification(multisig_tx.__class__, multisig_tx, created=False)
+        )
+
+        multisig_tx.trusted = True
         self.assertTrue(
             is_relevant_notification(multisig_tx.__class__, multisig_tx, created=False)
         )
-        multisig_tx.created -= timedelta(minutes=45)
+
+        multisig_tx.created -= timedelta(minutes=75)
         self.assertTrue(
             is_relevant_notification(multisig_tx.__class__, multisig_tx, created=False)
         )
-        multisig_tx.modified -= timedelta(minutes=45)
+        multisig_tx.modified -= timedelta(minutes=75)
         self.assertFalse(
             is_relevant_notification(multisig_tx.__class__, multisig_tx, created=False)
         )

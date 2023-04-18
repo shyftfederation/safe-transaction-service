@@ -5,12 +5,16 @@ from typing import Any, Dict, List, Optional, OrderedDict, Sequence
 
 from django.conf import settings
 
+import gevent
 from eth_typing import ChecksumAddress
 from eth_utils import event_abi_to_log_topic
+from gevent import pool
 from hexbytes import HexBytes
 from web3.contract import ContractEvent
 from web3.exceptions import LogTopicError
 from web3.types import EventData, FilterParams, LogReceipt
+
+from safe_transaction_service.utils.utils import FixedSizeDict, chunks
 
 from .ethereum_indexer import EthereumIndexer, FindRelevantElementsException
 
@@ -22,9 +26,11 @@ class EventsIndexer(EthereumIndexer):
     Indexes Ethereum events
     """
 
-    IGNORE_ADDRESSES_ON_LOG_FILTER: bool = (
-        False  # If True, don't use addresses to filter logs
-    )
+    # If True, don't use addresses to filter logs
+    # Be careful, some nodes have limitations
+    # https://docs.nodereal.io/nodereal/meganode/api-docs/bnb-smart-chain-api/eth_getlogs-bsc
+    # https://docs.infura.io/infura/networks/ethereum/json-rpc-methods/eth_getlogs#limitations
+    IGNORE_ADDRESSES_ON_LOG_FILTER: bool = False
 
     def __init__(self, *args, **kwargs):
         kwargs.setdefault(
@@ -37,13 +43,50 @@ class EventsIndexer(EthereumIndexer):
             "blocks_to_reindex_again", 10
         )  # Reindex last 10 blocks every run of the indexer
         kwargs.setdefault(
-            "confirmations", 2
-        )  # Due to reorgs, wait for the last 2 blocks
-        kwargs.setdefault("query_chunk_size", settings.ETH_EVENTS_QUERY_CHUNK_SIZE)
+            "query_chunk_size", settings.ETH_EVENTS_QUERY_CHUNK_SIZE
+        )  # Number of elements to process together when calling `eth_getLogs`
         kwargs.setdefault(
             "updated_blocks_behind", settings.ETH_EVENTS_UPDATED_BLOCK_BEHIND
-        )  # For last x blocks, process `query_chunk_size` elements together
+        )  # For last x blocks, consider them almost updated and process them first
+
+        # Number of concurrent requests to `getLogs`
+        self.get_logs_concurrency = settings.ETH_EVENTS_GET_LOGS_CONCURRENCY
+        self._processed_element_cache = FixedSizeDict(maxlen=40_000)  # Around 3MiB
+
         super().__init__(*args, **kwargs)
+
+    def mark_as_processed(self, log_receipt: LogReceipt) -> bool:
+        """
+        Mark event as processed by the indexer
+
+        :param log_receipt:
+        :return: `True` if `event` was marked as processed, `False` if it was already processed
+        """
+
+        # Calculate id, collision should be almost impossible
+        # Add blockHash to prevent reorg issues
+        block_hash = HexBytes(log_receipt["blockHash"])
+        tx_hash = HexBytes(log_receipt["transactionHash"])
+        log_index = log_receipt["logIndex"]
+        event_id = block_hash + tx_hash + HexBytes(log_index)
+
+        if event_id in self._processed_element_cache:
+            logger.debug(
+                "Event with tx-hash=%s log-index=%d on block=%s was already processed",
+                tx_hash.hex(),
+                log_index,
+                block_hash.hex(),
+            )
+            return False
+        else:
+            logger.debug(
+                "Marking event with tx-hash=%s log-index=%d on block=%s as processed",
+                tx_hash.hex(),
+                log_index,
+                block_hash.hex(),
+            )
+            self._processed_element_cache[event_id] = None
+            return True
 
     @property
     @abstractmethod
@@ -81,9 +124,34 @@ class EventsIndexer(EthereumIndexer):
         }
 
         if not self.IGNORE_ADDRESSES_ON_LOG_FILTER:
-            parameters["address"] = addresses
+            # Search logs only for the provided addresses
+            if self.query_chunk_size:
+                addresses_chunks = chunks(addresses, self.query_chunk_size)
+            else:
+                addresses_chunks = [addresses]
 
-        return self.ethereum_client.slow_w3.eth.get_logs(parameters)
+            multiple_parameters = [
+                {**parameters, "address": addresses_chunk}
+                for addresses_chunk in addresses_chunks
+            ]
+
+            gevent_pool = pool.Pool(self.get_logs_concurrency)
+            jobs = [
+                gevent_pool.spawn(
+                    self.ethereum_client.slow_w3.eth.get_logs, single_parameters
+                )
+                for single_parameters in multiple_parameters
+            ]
+
+            with self.auto_adjust_block_limit(from_block_number, to_block_number):
+                # Check how long the first job takes
+                gevent.joinall(jobs[:1])
+
+            gevent.joinall(jobs)
+            return [log_receipt for job in jobs for log_receipt in job.get()]
+        else:
+            with self.auto_adjust_block_limit(from_block_number, to_block_number):
+                return self.ethereum_client.slow_w3.eth.get_logs(parameters)
 
     def _find_elements_using_topics(
         self,
@@ -146,27 +214,25 @@ class EventsIndexer(EthereumIndexer):
         """
         len_addresses = len(addresses)
         logger.debug(
-            "%s: Filtering for events from block-number=%d to block-number=%d for %d addresses: %s",
+            "%s: Filtering for events from block-number=%d to block-number=%d for %d addresses",
             self.__class__.__name__,
             from_block_number,
             to_block_number,
             len_addresses,
-            addresses[:10],
         )
         log_receipts = self._find_elements_using_topics(
             addresses, from_block_number, to_block_number
         )
 
-        len_events = len(log_receipts)
-        logger_fn = logger.info if len_events else logger.debug
+        len_log_receipts = len(log_receipts)
+        logger_fn = logger.info if len_log_receipts else logger.debug
         logger_fn(
-            "%s: Found %d events from block-number=%d to block-number=%d for %d addresses: %s",
+            "%s: Found %d events from block-number=%d to block-number=%d for %d addresses",
             self.__class__.__name__,
-            len_events,
+            len_log_receipts,
             from_block_number,
             to_block_number,
             len_addresses,
-            addresses[:10],
         )
         return log_receipts
 
@@ -197,9 +263,17 @@ class EventsIndexer(EthereumIndexer):
         if not log_receipts:
             return []
 
-        decoded_elements: List[EventData] = self.decode_elements(log_receipts)
+        # Ignore already processed events
+        not_processed_log_receipts = [
+            log_receipt
+            for log_receipt in log_receipts
+            if self.mark_as_processed(log_receipt)
+        ]
+        decoded_elements: List[EventData] = self.decode_elements(
+            not_processed_log_receipts
+        )
         tx_hashes = OrderedDict.fromkeys(
-            [event["transactionHash"] for event in log_receipts]
+            [event["transactionHash"] for event in not_processed_log_receipts]
         ).keys()
         logger.debug("Prefetching and storing %d ethereum txs", len(tx_hashes))
         self.index_service.txs_create_or_update_from_tx_hashes(tx_hashes)
@@ -207,8 +281,7 @@ class EventsIndexer(EthereumIndexer):
         logger.debug("Processing %d decoded events", len(decoded_elements))
         processed_elements = []
         for decoded_element in decoded_elements:
-            processed_element = self._process_decoded_element(decoded_element)
-            if processed_element:
+            if processed_element := self._process_decoded_element(decoded_element):
                 processed_elements.append(processed_element)
         logger.debug("End processing %d decoded events", len(decoded_elements))
         return processed_elements

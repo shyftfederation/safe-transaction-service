@@ -16,17 +16,20 @@ from gnosis.safe.safe_signature import SafeSignatureType
 from safe_transaction_service.contracts.models import ContractQuerySet
 from safe_transaction_service.contracts.tests.factories import ContractFactory
 
+from ...tokens.tests.factories import TokenFactory
 from ..models import (
     ERC20Transfer,
     ERC721Transfer,
     EthereumBlock,
     EthereumBlockManager,
+    EthereumTx,
     EthereumTxCallType,
     InternalTx,
     InternalTxDecoded,
     MultisigConfirmation,
     MultisigTransaction,
     SafeContractDelegate,
+    SafeLastStatus,
     SafeMasterCopy,
     SafeStatus,
     WebHook,
@@ -42,10 +45,12 @@ from .factories import (
     MultisigTransactionFactory,
     SafeContractDelegateFactory,
     SafeContractFactory,
+    SafeLastStatusFactory,
     SafeMasterCopyFactory,
     SafeStatusFactory,
     WebHookFactory,
 )
+from .mocks.mocks_ethereum_tx import type_0_tx, type_2_tx
 from .mocks.mocks_internal_tx_indexer import block_result
 
 logger = logging.getLogger(__name__)
@@ -173,6 +178,16 @@ class TestMultisigTransaction(TestCase):
         multisig_transaction.save()
         self.assertEqual(multisig_transaction.owners, [account.address])
 
+    def test_multisend(self):
+        self.assertEqual(MultisigTransaction.objects.multisend().count(), 0)
+        MultisigTransactionFactory()
+
+        MultisigTransactionFactory(to="0x998739BFdAAdde7C933B942a68053933098f9EDa")
+        self.assertEqual(MultisigTransaction.objects.multisend().count(), 1)
+
+        MultisigTransactionFactory(to="0x40A2aCCbd92BCA938b02010E17A5b8929b49130D")
+        self.assertEqual(MultisigTransaction.objects.multisend().count(), 2)
+
     def test_queued(self):
         safe_address = Account.create().address
         queryset = MultisigTransaction.objects.queued(safe_address)
@@ -269,7 +284,42 @@ class TestSafeMasterCopy(TestCase):
 
 
 class TestEthereumTx(TestCase):
-    pass
+    def test_create_from_tx_dict(self):
+        for tx_mock in (type_0_tx, type_2_tx):
+            with self.subTest(tx_mock=tx_mock):
+                tx_dict = tx_mock["tx"]
+                ethereum_tx = EthereumTx.objects.create_from_tx_dict(tx_dict)
+                self.assertEqual(ethereum_tx.type, int(tx_dict["type"], 0))
+                self.assertEqual(ethereum_tx.gas_price, tx_dict["gasPrice"])
+                self.assertEqual(
+                    ethereum_tx.max_fee_per_gas, tx_dict.get("maxFeePerGas")
+                )
+                self.assertEqual(
+                    ethereum_tx.max_priority_fee_per_gas,
+                    tx_dict.get("maxPriorityFeePerGas"),
+                )
+                self.assertIsNone(ethereum_tx.gas_used)
+                self.assertIsNone(ethereum_tx.status)
+                self.assertIsNone(ethereum_tx.transaction_index)
+
+                tx_receipt = tx_mock["receipt"]
+                ethereum_tx.delete()
+                ethereum_tx = EthereumTx.objects.create_from_tx_dict(
+                    tx_dict, tx_receipt=tx_receipt
+                )
+                self.assertEqual(ethereum_tx.gas_price, tx_receipt["effectiveGasPrice"])
+                self.assertEqual(
+                    ethereum_tx.max_fee_per_gas, tx_dict.get("maxFeePerGas")
+                )
+                self.assertEqual(
+                    ethereum_tx.max_priority_fee_per_gas,
+                    tx_dict.get("maxPriorityFeePerGas"),
+                )
+                self.assertEqual(ethereum_tx.gas_used, tx_receipt["gasUsed"])
+                self.assertEqual(ethereum_tx.status, tx_receipt["status"])
+                self.assertEqual(
+                    ethereum_tx.transaction_index, tx_receipt["transactionIndex"]
+                )
 
 
 class TestTokenTransfer(TestCase):
@@ -373,6 +423,46 @@ class TestTokenTransfer(TestCase):
         ERC721TransferFactory(_from=random_address, to=random_address, token_id=6)
         self.assertEqual(
             len(ERC721Transfer.objects.erc721_owned_by(address=random_address)), 1
+        )
+
+    def test_erc721_owned_by_trusted_spam(self):
+        random_address = Account.create().address
+        self.assertEqual(
+            ERC721Transfer.objects.erc721_owned_by(address=random_address), []
+        )
+        erc721_transfer = ERC721TransferFactory(to=random_address)
+        erc721_transfer_2 = ERC721TransferFactory(to=random_address)
+        token = TokenFactory(address=erc721_transfer.address, spam=True)
+        self.assertEqual(
+            len(ERC721Transfer.objects.erc721_owned_by(address=random_address)), 2
+        )
+        self.assertEqual(
+            len(
+                ERC721Transfer.objects.erc721_owned_by(
+                    address=random_address, exclude_spam=True
+                )
+            ),
+            1,
+        )
+
+        self.assertEqual(
+            len(
+                ERC721Transfer.objects.erc721_owned_by(
+                    address=random_address, only_trusted=True
+                )
+            ),
+            0,
+        )
+        token.trusted = True
+        token.spam = False
+        token.save(update_fields=["trusted", "spam"])
+        self.assertEqual(
+            len(
+                ERC721Transfer.objects.erc721_owned_by(
+                    address=random_address, only_trusted=True
+                )
+            ),
+            1,
         )
 
 
@@ -542,26 +632,27 @@ class TestInternalTxDecoded(TestCase):
             InternalTxDecoded.objects.order_by_processing_queue(), []
         )
         ethereum_tx = EthereumTxFactory()
-        internal_tx_decoded_1 = InternalTxDecodedFactory(
-            internal_tx__trace_address="1", internal_tx__ethereum_tx=ethereum_tx
-        )
+        # `trace_address` is not used for ordering anymore
         internal_tx_decoded_0 = InternalTxDecodedFactory(
             internal_tx__trace_address="0", internal_tx__ethereum_tx=ethereum_tx
         )
-        internal_tx_decoded_5 = InternalTxDecodedFactory(
-            internal_tx__trace_address="5", internal_tx__ethereum_tx=ethereum_tx
+        internal_tx_decoded_1 = InternalTxDecodedFactory(
+            internal_tx__trace_address="2", internal_tx__ethereum_tx=ethereum_tx
+        )
+        internal_tx_decoded_15 = InternalTxDecodedFactory(
+            internal_tx__trace_address="15", internal_tx__ethereum_tx=ethereum_tx
         )
 
         self.assertQuerysetEqual(
             InternalTxDecoded.objects.order_by_processing_queue(),
-            [internal_tx_decoded_0, internal_tx_decoded_1, internal_tx_decoded_5],
+            [internal_tx_decoded_0, internal_tx_decoded_1, internal_tx_decoded_15],
         )
 
-        internal_tx_decoded_5.function_name = "setup"
-        internal_tx_decoded_5.save()
+        internal_tx_decoded_15.function_name = "setup"
+        internal_tx_decoded_15.save()
         self.assertQuerysetEqual(
             InternalTxDecoded.objects.order_by_processing_queue(),
-            [internal_tx_decoded_5, internal_tx_decoded_0, internal_tx_decoded_1],
+            [internal_tx_decoded_15, internal_tx_decoded_0, internal_tx_decoded_1],
         )
 
     def test_safes_pending_to_be_processed(self):
@@ -594,15 +685,237 @@ class TestInternalTxDecoded(TestCase):
             InternalTxDecoded.objects.safes_pending_to_be_processed(), [safe_address_1]
         )
 
+    def test_out_of_order_for_safe(self):
+        random_safe = Account.create().address
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        i = InternalTxDecodedFactory(
+            internal_tx___from=random_safe,
+            internal_tx__block_number=10,
+            processed=False,
+        )
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        i.set_processed()
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        InternalTxDecodedFactory(
+            internal_tx___from=random_safe,
+            internal_tx__block_number=11,
+            processed=False,
+        )
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        InternalTxDecodedFactory(
+            internal_tx___from=random_safe, internal_tx__block_number=9, processed=False
+        )
+        self.assertTrue(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+        i.processed = False
+        i.save(update_fields=["processed"])
+
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        InternalTxDecodedFactory(
+            internal_tx___from=random_safe, internal_tx__block_number=8, processed=True
+        )
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        InternalTxDecodedFactory(
+            internal_tx___from=random_safe, internal_tx__block_number=9, processed=True
+        )
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        InternalTxDecodedFactory(
+            internal_tx___from=random_safe, internal_tx__block_number=10, processed=True
+        )
+        self.assertTrue(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+
+class TestLastSafeStatus(TestCase):
+    def test_insert(self):
+        self.assertEqual(SafeStatus.objects.count(), 0)
+        self.assertEqual(SafeLastStatus.objects.count(), 0)
+        SafeLastStatusFactory()
+        self.assertEqual(SafeStatus.objects.count(), 1)
+        self.assertEqual(SafeLastStatus.objects.count(), 1)
+
+    def test_update_or_create_from_safe_status(self):
+        safe_status = SafeStatusFactory(nonce=0)
+        self.assertEqual(SafeStatus.objects.count(), 1)
+        self.assertEqual(SafeLastStatus.objects.count(), 0)
+
+        safe_last_status = SafeLastStatus.objects.update_or_create_from_safe_status(
+            safe_status
+        )
+        self.assertEqual(SafeStatus.objects.count(), 1)
+        self.assertEqual(SafeLastStatus.objects.count(), 1)
+
+        self.assertEqual(safe_status.internal_tx, safe_last_status.internal_tx)
+        self.assertEqual(safe_status.address, safe_last_status.address)
+        self.assertEqual(safe_status.owners, safe_last_status.owners)
+        self.assertEqual(safe_status.threshold, safe_last_status.threshold)
+        self.assertEqual(safe_status.nonce, safe_last_status.nonce)
+        self.assertEqual(safe_status.master_copy, safe_last_status.master_copy)
+        self.assertEqual(
+            safe_status.fallback_handler, safe_last_status.fallback_handler
+        )
+        self.assertEqual(safe_status.guard, safe_last_status.guard)
+        self.assertEqual(safe_status.enabled_modules, safe_last_status.enabled_modules)
+
+        # Update SafeLastStatus
+        safe_last_status.internal_tx = InternalTxFactory()
+        safe_last_status.nonce = 1
+        safe_last_status.save()
+        self.assertEqual(SafeStatus.objects.count(), 2)
+        self.assertEqual(SafeLastStatus.objects.count(), 1)
+
+    def test_address_for_module(self):
+        module_address = Account.create().address
+        address = Account.create().address
+        address_2 = Account.create().address
+        self.assertCountEqual(
+            SafeLastStatus.objects.addresses_for_module(module_address), []
+        )
+        safe_last_status = SafeLastStatusFactory(
+            address=address, nonce=0, enabled_modules=[module_address]
+        )
+        self.assertCountEqual(
+            SafeLastStatus.objects.addresses_for_module(module_address), [address]
+        )
+        safe_last_status.delete()
+        safe_last_status = SafeLastStatusFactory(address=address, nonce=1)
+        self.assertCountEqual(
+            SafeLastStatus.objects.addresses_for_module(module_address), []
+        )
+        safe_last_status.delete()
+        safe_last_status = SafeLastStatusFactory(
+            address=address, nonce=2, enabled_modules=[module_address]
+        )
+        safe_last_status_2 = SafeLastStatusFactory(
+            address=address_2, nonce=0, enabled_modules=[module_address]
+        )
+        self.assertCountEqual(
+            SafeLastStatus.objects.addresses_for_module(module_address),
+            [address, address_2],
+        )
+        # Remove the module from one of the Safes
+        new_module = Account.create().address
+        safe_last_status.delete()
+        safe_last_status = SafeLastStatusFactory(
+            address=address, nonce=3, enabled_modules=[new_module]
+        )
+        self.assertCountEqual(
+            SafeLastStatus.objects.addresses_for_module(module_address), [address_2]
+        )
+
+        # Add new module for the other Safe
+        safe_last_status_2.delete()
+        safe_last_status_2 = SafeLastStatusFactory(
+            address=address_2, nonce=1, enabled_modules=[module_address, new_module]
+        )
+        self.assertCountEqual(
+            SafeLastStatus.objects.addresses_for_module(module_address), [address_2]
+        )
+
+        # Remove the module from the other Safe
+        safe_last_status_2.delete()
+        SafeLastStatusFactory(address=address_2, nonce=2, enabled_modules=[new_module])
+        self.assertCountEqual(
+            SafeLastStatus.objects.addresses_for_module(module_address), []
+        )
+
+    def test_addresses_for_owner(self):
+        owner_address = Account.create().address
+        address = Account.create().address
+        address_2 = Account.create().address
+        self.assertCountEqual(
+            SafeLastStatus.objects.addresses_for_owner(owner_address), []
+        )
+        safe_last_status = SafeLastStatusFactory(
+            address=address, nonce=0, owners=[owner_address]
+        )
+        self.assertCountEqual(
+            SafeLastStatus.objects.addresses_for_owner(owner_address), [address]
+        )
+        safe_last_status.delete()
+        safe_last_status = SafeLastStatusFactory(address=address, nonce=1)
+        self.assertCountEqual(
+            SafeLastStatus.objects.addresses_for_owner(owner_address), []
+        )
+        safe_last_status.delete()
+        safe_last_status = SafeLastStatusFactory(
+            address=address, nonce=2, owners=[owner_address]
+        )
+        safe_last_status_2 = SafeLastStatusFactory(
+            address=address_2, nonce=0, owners=[owner_address]
+        )
+        self.assertCountEqual(
+            SafeLastStatus.objects.addresses_for_owner(owner_address),
+            [address, address_2],
+        )
+        # Remove the owner from one of the Safes
+        new_owner = Account.create().address
+        safe_last_status.delete()
+        safe_last_status = SafeLastStatusFactory(
+            address=address, nonce=3, owners=[new_owner]
+        )
+        self.assertCountEqual(
+            SafeLastStatus.objects.addresses_for_owner(owner_address), [address_2]
+        )
+
+        # Add new owner for the other Safe
+        safe_last_status_2.delete()
+        safe_last_status_2 = SafeLastStatusFactory(
+            address=address_2, nonce=1, owners=[owner_address, new_owner]
+        )
+        self.assertCountEqual(
+            SafeLastStatus.objects.addresses_for_owner(owner_address), [address_2]
+        )
+
+        # Remove the owner from the other Safe
+        safe_last_status_2.delete()
+        SafeLastStatusFactory(address=address_2, nonce=2, owners=[new_owner])
+        self.assertCountEqual(
+            SafeLastStatus.objects.addresses_for_owner(owner_address), []
+        )
+
+
+class TestSafeLastStatus(TestCase):
+    def test_get_or_generate(self):
+        address = Account.create().address
+        with self.assertRaises(SafeLastStatus.DoesNotExist):
+            SafeLastStatus.objects.get_or_generate(address)
+
+        SafeStatusFactory(address=address, nonce=0)
+        SafeStatusFactory(address=address, nonce=5)
+        self.assertEqual(SafeLastStatus.objects.count(), 0)
+        # SafeLastStatus should be created from latest SafeStatus
+        self.assertEqual(SafeLastStatus.objects.get_or_generate(address).nonce, 5)
+        self.assertEqual(SafeLastStatus.objects.count(), 1)
+
+        # SafeLastStatus was already created and will not be increased
+        SafeStatusFactory(address=address, nonce=7)
+        self.assertEqual(SafeLastStatus.objects.get_or_generate(address).nonce, 5)
+
+        SafeLastStatus.objects.all().delete()
+        SafeLastStatusFactory(address=address, nonce=17)
+        self.assertEqual(SafeLastStatus.objects.get_or_generate(address).nonce, 17)
+
+    def test_is_corrupted(self):
+        address = Account.create().address
+        SafeStatusFactory(address=address, nonce=0)
+        SafeStatusFactory(address=address, nonce=2)
+        safe_last_status = SafeLastStatus.objects.get_or_generate(address)
+        self.assertTrue(safe_last_status.is_corrupted())
+
+        SafeStatusFactory(address=address, nonce=1)
+        self.assertFalse(safe_last_status.is_corrupted())
+
+        SafeStatus.objects.all().delete()
+        self.assertFalse(safe_last_status.is_corrupted())
+
 
 class TestSafeStatus(TestCase):
-    def test_safe_status_store_new(self):
-        safe_status = SafeStatusFactory()
-        self.assertEqual(SafeStatus.objects.all().count(), 1)
-        internal_tx = InternalTxFactory()
-        safe_status.store_new(internal_tx)
-        self.assertEqual(SafeStatus.objects.all().count(), 2)
-
     def test_safe_status_is_corrupted(self):
         address = Account.create().address
         safe_status = SafeStatusFactory(nonce=0, address=address)
@@ -631,39 +944,6 @@ class TestSafeStatus(TestCase):
         SafeStatusFactory(address=address, nonce=2)
         self.assertEqual(SafeStatus.objects.last_for_address(address).nonce, 2)
         self.assertIsNone(SafeStatus.objects.last_for_address(Account.create().address))
-
-    def test_safe_status_addresses_for_owner(self):
-        owner_address = Account.create().address
-        address = Account.create().address
-        address_2 = Account.create().address
-        self.assertEqual(SafeStatus.objects.addresses_for_owner(owner_address), set())
-        SafeStatusFactory(address=address, nonce=0, owners=[owner_address])
-        self.assertEqual(
-            SafeStatus.objects.addresses_for_owner(owner_address), {address}
-        )
-        SafeStatusFactory(address=address, nonce=1)
-        self.assertEqual(SafeStatus.objects.addresses_for_owner(owner_address), set())
-        SafeStatusFactory(address=address, nonce=2, owners=[owner_address])
-        SafeStatusFactory(address=address_2, nonce=0, owners=[owner_address])
-        self.assertEqual(
-            SafeStatus.objects.addresses_for_owner(owner_address), {address, address_2}
-        )
-        # Remove the owner from one of the Safes
-        new_owner = Account.create().address
-        SafeStatusFactory(address=address, nonce=3, owners=[new_owner])
-        self.assertEqual(
-            SafeStatus.objects.addresses_for_owner(owner_address), {address_2}
-        )
-
-        # Add new owner for the other Safe
-        SafeStatusFactory(address=address_2, nonce=1, owners=[owner_address, new_owner])
-        self.assertEqual(
-            SafeStatus.objects.addresses_for_owner(owner_address), {address_2}
-        )
-
-        # Remove the owner from the other Safe
-        SafeStatusFactory(address=address_2, nonce=2, owners=[new_owner])
-        self.assertEqual(SafeStatus.objects.addresses_for_owner(owner_address), set())
 
     def test_safe_status_previous(self):
         safe_status_5 = SafeStatusFactory(nonce=5)
@@ -1035,17 +1315,19 @@ class TestMultisigTransactions(TestCase):
         )
 
     def test_not_indexed_metadata_contract_addresses(self):
+        # Transaction must be trusted
+        MultisigTransactionFactory(data=b"12")
         self.assertFalse(
             MultisigTransaction.objects.not_indexed_metadata_contract_addresses()
         )
 
-        MultisigTransactionFactory(data=None)
+        MultisigTransactionFactory(trusted=True, data=None)
         self.assertFalse(
             MultisigTransaction.objects.not_indexed_metadata_contract_addresses()
         )
-        multisig_transaction = MultisigTransactionFactory(data=b"12")
+        multisig_transaction = MultisigTransactionFactory(trusted=True, data=b"12")
         MultisigTransactionFactory(
-            data=b"12", to=multisig_transaction.to
+            trusted=True, data=b"12", to=multisig_transaction.to
         )  # Check distinct
         self.assertCountEqual(
             MultisigTransaction.objects.not_indexed_metadata_contract_addresses(),
@@ -1054,6 +1336,69 @@ class TestMultisigTransactions(TestCase):
         ContractFactory(address=multisig_transaction.to)
         self.assertFalse(
             MultisigTransaction.objects.not_indexed_metadata_contract_addresses()
+        )
+
+    def test_with_confirmations_required(self):
+        # This should never be picked
+        SafeStatusFactory(nonce=0, threshold=4)
+
+        multisig_transaction = MultisigTransactionFactory()
+        self.assertIsNone(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required
+        )
+
+        # SafeStatus not matching the EthereumTx
+        safe_status = SafeStatusFactory(nonce=1, threshold=8)
+        self.assertIsNone(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required
+        )
+
+        safe_status.internal_tx.ethereum_tx = multisig_transaction.ethereum_tx
+        safe_status.internal_tx.save(update_fields=["ethereum_tx"])
+
+        self.assertEqual(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required,
+            8,
+        )
+
+        # It will not be picked, as EthereumTx is not matching
+        SafeStatusFactory(nonce=2, threshold=15)
+        self.assertEqual(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required,
+            8,
+        )
+
+        # As EthereumTx is empty, the latest safe status will be used if available
+        multisig_transaction.ethereum_tx = None
+        multisig_transaction.save(update_fields=["ethereum_tx"])
+        self.assertIsNone(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required
+        )
+
+        # Not matching address should not return anything
+        SafeLastStatusFactory(nonce=2, threshold=16)
+        self.assertIsNone(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required
+        )
+
+        SafeLastStatusFactory(address=multisig_transaction.safe, nonce=2, threshold=15)
+        self.assertEqual(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required,
+            15,
         )
 
     def test_with_confirmations(self):

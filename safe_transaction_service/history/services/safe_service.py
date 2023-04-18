@@ -1,18 +1,19 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Optional, Tuple, Union
 
+from eth_typing import ChecksumAddress
 from web3 import Web3
 
-from gnosis.eth import EthereumClient
+from gnosis.eth import EthereumClient, EthereumClientProvider
 from gnosis.eth.contracts import get_cpk_factory_contract, get_proxy_factory_contract
 from gnosis.safe import Safe
 from gnosis.safe.exceptions import CannotRetrieveSafeInfoException
 from gnosis.safe.safe import SafeInfo
 
 from ..exceptions import NodeConnectionException
-from ..models import InternalTx
+from ..models import InternalTx, SafeLastStatus, SafeMasterCopy
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,11 @@ class SafeServiceException(Exception):
     pass
 
 
-class CannotGetSafeInfo(SafeServiceException):
+class CannotGetSafeInfoFromBlockchain(SafeServiceException):
+    pass
+
+
+class CannotGetSafeInfoFromDB(SafeServiceException):
     pass
 
 
@@ -43,13 +48,13 @@ class SafeServiceProvider:
         if not hasattr(cls, "instance"):
             from django.conf import settings
 
-            tracing_enabled = bool(settings.ETHEREUM_TRACING_NODE_URL)
-            node_url = (
-                settings.ETHEREUM_TRACING_NODE_URL
-                if tracing_enabled
-                else settings.ETHEREUM_NODE_URL
+            ethereum_client = EthereumClientProvider()
+            ethereum_tracing_client = (
+                EthereumClient(settings.ETHEREUM_TRACING_NODE_URL)
+                if settings.ETHEREUM_TRACING_NODE_URL
+                else None
             )
-            cls.instance = SafeService(EthereumClient(node_url), tracing_enabled)
+            cls.instance = SafeService(ethereum_client, ethereum_tracing_client)
         return cls.instance
 
     @classmethod
@@ -59,9 +64,18 @@ class SafeServiceProvider:
 
 
 class SafeService:
-    def __init__(self, ethereum_client: EthereumClient, tracing_enabled: bool):
+    def __init__(
+        self,
+        ethereum_client: EthereumClient,
+        ethereum_tracing_client: Optional[EthereumClient],
+    ):
+        """
+        :param ethereum_client: Used for regular RPC calls
+        :param ethereum_tracing_client: Used for RPC calls requiring trace methods. It's required to get
+            next or previous traces for a given `InternalTx` if not found on database
+        """
         self.ethereum_client = ethereum_client
-        self.tracing_enabled = tracing_enabled
+        self.ethereum_tracing_client = ethereum_tracing_client
         dummy_w3 = Web3()  # Not needed, just used to decode contracts
         self.proxy_factory_contract = get_proxy_factory_contract(dummy_w3)
         self.cpk_proxy_factory_contract = get_cpk_factory_contract(dummy_w3)
@@ -116,14 +130,49 @@ class SafeService:
             creation_internal_tx.ethereum_tx_id,
         )
 
-    def get_safe_info(self, safe_address: str) -> SafeInfo:
+    def get_safe_info(self, safe_address: ChecksumAddress) -> SafeInfo:
+        """
+        :param safe_address:
+        :return: SafeInfo for the provided `safe_address`. First tries database, if not
+            found or if `nonce=0` it will try blockchain
+        :raises: CannotGetSafeInfoFromBlockchain
+        """
+        try:
+            safe_info = self.get_safe_info_from_db(safe_address)
+            if safe_info.nonce == 0:
+                # This works for:
+                # - Not indexed Safes
+                # - Not L2 Safes on L2 networks
+                raise CannotGetSafeInfoFromDB
+            return safe_info
+        except CannotGetSafeInfoFromDB:
+            return self.get_safe_info_from_blockchain(safe_address)
+
+    def get_safe_info_from_blockchain(self, safe_address: ChecksumAddress) -> SafeInfo:
+        """
+        :param safe_address:
+        :return: SafeInfo from blockchain
+        """
         try:
             safe = Safe(safe_address, self.ethereum_client)
-            return safe.retrieve_all_info()
+            safe_info = safe.retrieve_all_info()
+            # Return same master copy information than the db method
+            return replace(
+                safe_info,
+                version=SafeMasterCopy.objects.get_version_for_address(
+                    safe_info.master_copy
+                ),
+            )
         except IOError as exc:
             raise NodeConnectionException from exc
-        except CannotRetrieveSafeInfoException as e:
-            raise CannotGetSafeInfo from e
+        except CannotRetrieveSafeInfoException as exc:
+            raise CannotGetSafeInfoFromBlockchain(safe_address) from exc
+
+    def get_safe_info_from_db(self, safe_address: ChecksumAddress) -> SafeInfo:
+        try:
+            return SafeLastStatus.objects.get_or_generate(safe_address).get_safe_info()
+        except SafeLastStatus.DoesNotExist as exc:
+            raise CannotGetSafeInfoFromDB(safe_address) from exc
 
     def _decode_proxy_factory(
         self, data: Union[bytes, str]
@@ -163,10 +212,10 @@ class SafeService:
     def _get_next_internal_tx(self, internal_tx: InternalTx) -> Optional[InternalTx]:
         if child_trace := internal_tx.get_child(0):
             return child_trace
-        if not self.tracing_enabled:
+        if not self.ethereum_tracing_client:
             return None
         try:
-            next_traces = self.ethereum_client.parity.get_next_traces(
+            next_traces = self.ethereum_tracing_client.parity.get_next_traces(
                 internal_tx.ethereum_tx_id,
                 internal_tx.trace_address_as_list,
                 remove_calls=True,
@@ -180,10 +229,10 @@ class SafeService:
     def _get_parent_internal_tx(self, internal_tx: InternalTx) -> InternalTx:
         if parent_trace := internal_tx.get_parent():
             return parent_trace
-        if not self.tracing_enabled:
+        if not self.ethereum_tracing_client:
             return None
         try:
-            previous_trace = self.ethereum_client.parity.get_previous_trace(
+            previous_trace = self.ethereum_tracing_client.parity.get_previous_trace(
                 internal_tx.ethereum_tx_id,
                 internal_tx.trace_address_as_list,
                 skip_delegate_calls=True,

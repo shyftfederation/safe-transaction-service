@@ -1,22 +1,26 @@
-from typing import Optional
+from typing import Any, Optional
 
+from django import forms
 from django.contrib import admin
-from django.db.models import F, Q
+from django.db.models import Exists, F, OuterRef, Q
 from django.db.models.functions import Greatest
 from django.db.transaction import atomic
+from django.http import HttpRequest
 
 from hexbytes import HexBytes
 from rest_framework.authtoken.admin import TokenAdmin
 
 from gnosis.eth import EthereumClientProvider
-
-from safe_transaction_service.utils.admin import BinarySearchAdmin
+from gnosis.eth.django.admin import BinarySearchAdmin
+from gnosis.safe import SafeTx
 
 from .models import (
+    Chain,
     ERC20Transfer,
     ERC721Transfer,
     EthereumBlock,
     EthereumTx,
+    IndexingStatus,
     InternalTx,
     InternalTxDecoded,
     ModuleTransaction,
@@ -25,11 +29,13 @@ from .models import (
     ProxyFactory,
     SafeContract,
     SafeContractDelegate,
+    SafeLastStatus,
     SafeMasterCopy,
     SafeStatus,
     WebHook,
 )
 from .services import IndexServiceProvider
+from .utils import HexField
 
 # By default, TokenAdmin doesn't allow key edition
 # IFF you have a service that requests from multiple safe-transaction-service
@@ -82,6 +88,24 @@ class SafeContractDelegateInline(admin.TabularInline):
 
 
 # Admin models ------------------------------
+@admin.register(IndexingStatus)
+class IndexingStatusAdmin(admin.ModelAdmin):
+    list_display = (
+        "indexing_type",
+        "block_number",
+    )
+    list_filter = ("indexing_type",)
+    search_fields = [
+        "=block_number",
+    ]
+    ordering = ["-indexing_type"]
+
+
+@admin.register(Chain)
+class ChainAdmin(admin.ModelAdmin):
+    list_display = ("chain_id",)
+
+
 @admin.register(EthereumBlock)
 class EthereumBlockAdmin(admin.ModelAdmin):
     date_hierarchy = "timestamp"
@@ -154,7 +178,7 @@ class EthereumTxAdmin(BinarySearchAdmin):
         MultisigConfirmationInline,
     )
     list_display = ("block_id", "tx_hash", "nonce", "_from", "to")
-    list_filter = ("status",)
+    list_filter = ("status", "type")
     search_fields = ["=tx_hash", "=_from", "=to"]
     ordering = ["-block_id"]
     raw_id_fields = ("block",)
@@ -179,7 +203,7 @@ class InternalTxAdmin(BinarySearchAdmin):
     ordering = [
         "-block_number",
         "-ethereum_tx__transaction_index",
-        "-trace_address",
+        "-pk",
     ]
     raw_id_fields = ("ethereum_tx",)
     search_fields = [
@@ -202,7 +226,11 @@ class InternalTxDecodedOfficialListFilter(admin.SimpleListFilter):
         if self.value() == "YES":
             return queryset.filter(
                 Q(
-                    internal_tx___from__in=SafeContract.objects.values("address")
+                    Exists(
+                        SafeContract.objects.filter(
+                            address=OuterRef("internal_tx___from")
+                        )
+                    )
                 )  # Just Safes indexed
                 | Q(function_name="setup")  # Safes pending to be indexed
             )
@@ -225,12 +253,11 @@ class InternalTxDecodedAdmin(BinarySearchAdmin):
     ordering = [
         "-internal_tx__block_number",
         "-internal_tx__ethereum_tx__transaction_index",
-        "-internal_tx__trace_address",
+        "-internal_tx_id",
     ]
     raw_id_fields = ("internal_tx",)
     search_fields = [
-        "function_name",
-        "arguments",
+        "=function_name",
         "=internal_tx__to",
         "=internal_tx___from",
         "=internal_tx__ethereum_tx__tx_hash",
@@ -307,9 +334,31 @@ class MultisigTransactionExecutedListFilter(admin.SimpleListFilter):
             return queryset.not_executed()
 
 
+class MultisigTransactionDataListFilter(admin.SimpleListFilter):
+    title = "Has data"
+    parameter_name = "has_data"
+
+    def lookups(self, request, model_admin):
+        return (
+            ("YES", "Transaction has data"),
+            ("NO", "Transaction data is empty"),
+        )
+
+    def queryset(self, request, queryset):
+        if self.value() == "YES":
+            return queryset.with_data()
+        elif self.value() == "NO":
+            return queryset.without_data()
+
+
+class MultisigTransactionAdminForm(forms.ModelForm):
+    data = HexField(required=False)
+
+
 @admin.register(MultisigTransaction)
 class MultisigTransactionAdmin(BinarySearchAdmin):
     date_hierarchy = "created"
+    form = MultisigTransactionAdminForm
     inlines = (MultisigConfirmationInline,)
     list_display = (
         "created",
@@ -321,12 +370,18 @@ class MultisigTransactionAdmin(BinarySearchAdmin):
         "ethereum_tx_id",
         "to",
         "value",
-        "data",
     )
-    list_filter = (MultisigTransactionExecutedListFilter, "failed", "trusted")
+    list_filter = (
+        MultisigTransactionExecutedListFilter,
+        MultisigTransactionDataListFilter,
+        "operation",
+        "failed",
+        "trusted",
+    )
     list_select_related = ("ethereum_tx",)
     ordering = ["-created"]
     raw_id_fields = ("ethereum_tx",)
+    readonly_fields = ("safe_tx_hash",)
     search_fields = ["=ethereum_tx__tx_hash", "=safe", "=to", "=safe_tx_hash"]
 
     @admin.display(boolean=True)
@@ -336,6 +391,35 @@ class MultisigTransactionAdmin(BinarySearchAdmin):
     @admin.display(boolean=True)
     def successful(self, obj: MultisigTransaction):
         return not obj.failed
+
+    def save_model(
+        self, request: HttpRequest, obj: MultisigTransaction, form: Any, change: Any
+    ) -> None:
+        if obj.safe_tx_hash:
+            # When modifying the primary key, another instance will be created so we delete the previous one if not executed
+            MultisigTransaction.objects.not_executed().filter(
+                safe_tx_hash=obj.safe_tx_hash
+            ).delete()
+
+        # Calculate new tx hash
+        # All the numbers are decimals, they need to be parsed as integers for SafeTx
+        safe_tx = SafeTx(
+            EthereumClientProvider(),
+            obj.safe,
+            obj.to,
+            int(obj.value),
+            obj.data,
+            int(obj.operation),
+            int(obj.safe_tx_gas),
+            int(obj.base_gas),
+            int(obj.gas_price),
+            obj.gas_token,
+            obj.refund_receiver,
+            obj.signatures,
+            safe_nonce=int(obj.nonce),
+        )
+        obj.safe_tx_hash = safe_tx.safe_tx_hash
+        return super().save_model(request, obj, form, change)
 
 
 @admin.register(ModuleTransaction)
@@ -443,35 +527,17 @@ class SafeContractERC20ListFilter(admin.SimpleListFilter):
 
 @admin.register(SafeContract)
 class SafeContractAdmin(BinarySearchAdmin):
-    actions = ["reindex", "reindex_last_day", "reindex_last_month"]
     inlines = (SafeContractDelegateInline,)
     list_display = (
         "created_block_number",
         "address",
         "ethereum_tx_id",
-        "erc20_block_number",
     )
     list_filter = (SafeContractERC20ListFilter,)
     list_select_related = ("ethereum_tx",)
     ordering = ["-ethereum_tx__block_id"]
     raw_id_fields = ("ethereum_tx",)
     search_fields = ["=address", "=ethereum_tx__tx_hash"]
-
-    @admin.action(description="Reindex from initial block")
-    def reindex(self, request, queryset):
-        queryset.exclude(ethereum_tx=None).update(
-            erc20_block_number=F("ethereum_tx__block_id")
-        )
-
-    @admin.action(description="Reindex last 24 hours")
-    def reindex_last_day(self, request, queryset):
-        queryset.update(erc20_block_number=Greatest(F("erc20_block_number") - 6000, 0))
-
-    @admin.action(description="Reindex last month")
-    def reindex_last_month(self, request, queryset):
-        queryset.update(
-            erc20_block_number=Greatest(F("erc20_block_number") - 200000, 0)
-        )
 
 
 @admin.register(SafeContractDelegate)
@@ -501,8 +567,8 @@ class SafeStatusModulesListFilter(admin.SimpleListFilter):
             return queryset.exclude(**parameters)
 
 
-@admin.register(SafeStatus)
-class SafeStatusAdmin(BinarySearchAdmin):
+@admin.register(SafeLastStatus)
+class SafeLastStatusAdmin(BinarySearchAdmin):
     actions = ["remove_and_index"]
     fields = (
         "internal_tx",
@@ -562,6 +628,11 @@ class SafeStatusAdmin(BinarySearchAdmin):
         IndexServiceProvider().reprocess_addresses(safe_addresses)
 
 
+@admin.register(SafeStatus)
+class SafeStatusAdmin(SafeLastStatusAdmin):
+    pass
+
+
 @admin.register(WebHook)
 class WebHookAdmin(BinarySearchAdmin):
     list_display = (
@@ -569,18 +640,18 @@ class WebHookAdmin(BinarySearchAdmin):
         "url",
         "authorization",
         "address",
-        "pending_outgoing_transaction",
+        "pending_multisig_transaction",
         "new_confirmation",
-        "new_executed_outgoing_transaction",
+        "new_executed_multisig_transaction",
         "new_incoming_transaction",
         "new_safe",
         "new_module_transaction",
         "new_outgoing_transaction",
     )
     list_filter = (
-        "pending_outgoing_transaction",
+        "pending_multisig_transaction",
         "new_confirmation",
-        "new_executed_outgoing_transaction",
+        "new_executed_multisig_transaction",
         "new_incoming_transaction",
         "new_safe",
         "new_module_transaction",

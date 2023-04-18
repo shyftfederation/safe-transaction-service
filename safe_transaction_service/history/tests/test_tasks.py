@@ -1,5 +1,7 @@
+import dataclasses
+import datetime
+import json
 import logging
-from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 from django.test import TestCase
@@ -10,8 +12,10 @@ from eth_account import Account
 
 from gnosis.eth import EthereumClient, EthereumNetwork
 
-from ..models import SafeContract, SafeStatus
-from ..services import IndexService
+from ...utils.redis import get_redis
+from ..models import MultisigTransaction, SafeContract, SafeLastStatus, SafeStatus
+from ..services import CollectiblesService, CollectiblesServiceProvider, IndexService
+from ..services.collectibles_service import CollectibleWithMetadata
 from ..tasks import (
     check_reorgs_task,
     check_sync_status_task,
@@ -27,12 +31,15 @@ from ..tasks import (
     process_decoded_internal_txs_for_safe_task,
     process_decoded_internal_txs_task,
     reindex_last_hours_task,
+    remove_not_trusted_multisig_txs_task,
+    retry_get_metadata_task,
 )
 from .factories import (
     ERC20TransferFactory,
     EthereumBlockFactory,
     InternalTxDecodedFactory,
     InternalTxFactory,
+    MultisigTransactionFactory,
     SafeContractFactory,
     SafeStatusFactory,
     WebHookFactory,
@@ -46,10 +53,10 @@ class TestTasks(TestCase):
         self.assertIsNone(check_reorgs_task.delay().result, 0)
 
     def test_check_sync_status_task(self):
-        self.assertTrue(check_sync_status_task.delay().result)
+        self.assertFalse(check_sync_status_task.delay().result)
 
     def test_index_erc20_events_task(self):
-        self.assertEqual(index_erc20_events_task.delay().result, 0)
+        self.assertEqual(index_erc20_events_task.delay().result, (0, 0))
 
     def test_index_erc20_events_out_of_sync_task(self):
         with self.assertLogs(logger=task_logger) as cm:
@@ -69,20 +76,23 @@ class TestTasks(TestCase):
             )
 
     def test_index_internal_txs_task(self):
-        self.assertEqual(index_internal_txs_task.delay().result, 0)
+        self.assertEqual(index_internal_txs_task.delay().result, (0, 0))
 
     def test_index_new_proxies_task(self):
-        self.assertEqual(index_new_proxies_task.delay().result, 0)
+        self.assertEqual(index_new_proxies_task.delay().result, (0, 0))
 
     def test_index_safe_events_task(self):
-        self.assertEqual(index_safe_events_task.delay().result, 0)
+        self.assertEqual(index_safe_events_task.delay().result, (0, 0))
 
+    @patch.object(IndexService, "reindex_erc20_events")
     @patch.object(IndexService, "reindex_master_copies")
-    def test_reindex_last_hours_task(self, reindex_master_copies_mock: MagicMock):
+    def test_reindex_last_hours_task(
+        self, reindex_master_copies_mock: MagicMock, reindex_erc20_events: MagicMock
+    ):
         now = timezone.now()
-        one_hour_ago = now - timedelta(hours=1)
-        one_day_ago = now - timedelta(days=1)
-        one_week_ago = now - timedelta(weeks=1)
+        one_hour_ago = now - datetime.timedelta(hours=1)
+        one_day_ago = now - datetime.timedelta(days=1)
+        one_week_ago = now - datetime.timedelta(weeks=1)
 
         reindex_last_hours_task()
         reindex_master_copies_mock.assert_not_called()
@@ -93,7 +103,11 @@ class TestTasks(TestCase):
         ethereum_block_3 = EthereumBlockFactory(timestamp=now)
 
         reindex_last_hours_task()
-        reindex_master_copies_mock.assert_called_with(
+        reindex_master_copies_mock.assert_called_once_with(
+            from_block_number=ethereum_block_1.number,
+            to_block_number=ethereum_block_3.number,
+        )
+        reindex_erc20_events.assert_called_once_with(
             from_block_number=ethereum_block_1.number,
             to_block_number=ethereum_block_3.number,
         )
@@ -152,6 +166,7 @@ class TestTasks(TestCase):
         safe_address = safe_status_0.address
         safe_status_2 = SafeStatusFactory(nonce=2, address=safe_address)
         safe_status_5 = SafeStatusFactory(nonce=5, address=safe_address)
+        SafeLastStatus.objects.update_or_create_from_safe_status(safe_status_5)
         with patch.object(IndexService, "reindex_master_copies") as reindex_mock:
             with patch.object(IndexService, "reprocess_addresses") as reprocess_mock:
                 with self.assertLogs(logger=task_logger) as cm:
@@ -185,3 +200,99 @@ class TestTasks(TestCase):
                         f"Safe-address={safe_address} Processing traces again after reindexing",
                         cm.output[5],
                     )
+
+    @patch.object(CollectiblesService, "get_metadata", autospec=True, return_value={})
+    def test_retry_get_metadata_task(self, get_metadata_mock: MagicMock):
+        redis = get_redis()
+        collectibles_service = CollectiblesServiceProvider()
+
+        collectible_address = Account.create().address
+        collectible_id = 16
+        metadata_cache_key = collectibles_service.get_metadata_cache_key(
+            collectible_address, collectible_id
+        )
+
+        metadata = {
+            "name": "Octopus",
+            "description": "Atlantic Octopus",
+            "image": "http://random-address.org/logo-28.png",
+        }
+
+        # Check metadata cannot be retrieved
+        get_metadata_mock.assert_not_called()
+        self.assertEqual(
+            retry_get_metadata_task(collectible_address, collectible_id), None
+        )
+        # Collectible needs to be cached so metadata can be fetched
+        get_metadata_mock.assert_not_called()
+
+        get_metadata_mock.return_value = metadata
+        expected = CollectibleWithMetadata(
+            "Octopus",
+            "OCT",
+            "http://random-address.org/logo.png",
+            collectible_address,
+            collectible_id,
+            "http://random-address.org/info-28.json",
+            metadata,
+        )
+        redis.set(
+            metadata_cache_key,
+            json.dumps(dataclasses.asdict(expected)),
+            ex=300,
+        )
+
+        self.assertEqual(
+            retry_get_metadata_task(collectible_address, collectible_id), expected
+        )
+        # As metadata was set, task is not requesting it
+        get_metadata_mock.assert_not_called()
+
+        collectible_without_metadata = CollectibleWithMetadata(
+            "Octopus",
+            "OCT",
+            "http://random-address.org/logo.png",
+            collectible_address,
+            collectible_id,
+            "http://random-address.org/info-28.json",
+            {},
+        )
+        redis.set(
+            metadata_cache_key,
+            json.dumps(dataclasses.asdict(collectible_without_metadata)),
+            ex=300,
+        )
+
+        self.assertEqual(
+            retry_get_metadata_task(collectible_address, collectible_id), expected
+        )
+        # As metadata was not set, task requested it
+        get_metadata_mock.assert_called_once()
+
+        self.assertEqual(
+            json.loads(redis.get(metadata_cache_key)), dataclasses.asdict(expected)
+        )
+        redis.delete(metadata_cache_key)
+
+    def test_remove_not_trusted_multisig_txs_task(self):
+        self.assertEqual(remove_not_trusted_multisig_txs_task.delay().result, 0)
+
+        MultisigTransactionFactory(trusted=False)
+        MultisigTransactionFactory(trusted=True)
+
+        self.assertEqual(remove_not_trusted_multisig_txs_task.delay().result, 0)
+
+        multisig_tx_expected_to_be_deleted = MultisigTransactionFactory(
+            trusted=False, modified=timezone.now() - datetime.timedelta(days=32)
+        )
+        MultisigTransactionFactory(
+            trusted=True, modified=timezone.now() - datetime.timedelta(days=32)
+        )
+
+        self.assertEqual(remove_not_trusted_multisig_txs_task.delay().result, 1)
+
+        self.assertFalse(
+            MultisigTransaction.objects.filter(
+                safe_tx_hash=multisig_tx_expected_to_be_deleted.safe_tx_hash
+            ).exists()
+        )

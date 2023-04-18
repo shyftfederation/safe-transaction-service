@@ -1,26 +1,45 @@
 import logging
+from dataclasses import dataclass
 from typing import Collection, List, Optional, OrderedDict, Union
 
 from django.db import IntegrityError, transaction
+from django.db.models import Min, Q
 
 from eth_typing import ChecksumAddress
 from hexbytes import HexBytes
 
 from gnosis.eth import EthereumClient, EthereumClientProvider
 
+from ..models import EthereumBlock, EthereumTx
+from ..models import IndexingStatus as IndexingStatusDb
 from ..models import (
-    EthereumBlock,
-    EthereumTx,
     InternalTxDecoded,
     ModuleTransaction,
     MultisigConfirmation,
     MultisigTransaction,
-    SafeContract,
+    SafeLastStatus,
     SafeMasterCopy,
     SafeStatus,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class IndexingStatus:
+    current_block_number: int
+    erc20_block_number: int
+    erc20_synced: bool
+    master_copies_block_number: int
+    master_copies_synced: bool
+    synced: bool
+
+
+@dataclass
+class ERC20IndexingStatus:
+    current_block_number: int
+    erc20_block_number: int
+    erc20_synced: bool
 
 
 class IndexingException(Exception):
@@ -87,6 +106,49 @@ class IndexService:
                 block, confirmed=confirmed
             )
 
+    def get_erc20_721_current_indexing_block_number(self) -> int:
+        return IndexingStatusDb.objects.get_erc20_721_indexing_status().block_number
+
+    def get_master_copies_current_indexing_block_number(self) -> Optional[int]:
+        return SafeMasterCopy.objects.relevant().aggregate(
+            min_master_copies_block_number=Min("tx_block_number")
+        )["min_master_copies_block_number"]
+
+    def get_indexing_status(self) -> IndexingStatus:
+        current_block_number = self.ethereum_client.current_block_number
+
+        # Indexing points to the next block to be indexed, we need the previous ones
+        erc20_block_number = min(
+            max(self.get_erc20_721_current_indexing_block_number() - 1, 0),
+            current_block_number,
+        )
+
+        if (
+            master_copies_current_indexing_block_number := self.get_master_copies_current_indexing_block_number()
+        ) is None:
+            master_copies_block_number = current_block_number
+        else:
+            master_copies_block_number = min(
+                max(master_copies_current_indexing_block_number - 1, 0),
+                current_block_number,
+            )
+
+        erc20_synced = (
+            current_block_number - erc20_block_number <= self.eth_reorg_blocks
+        )
+        master_copies_synced = (
+            current_block_number - master_copies_block_number <= self.eth_reorg_blocks
+        )
+
+        return IndexingStatus(
+            current_block_number=current_block_number,
+            erc20_block_number=erc20_block_number,
+            erc20_synced=erc20_synced,
+            master_copies_block_number=master_copies_block_number,
+            master_copies_synced=master_copies_synced,
+            synced=erc20_synced and master_copies_synced,
+        )
+
     def is_service_synced(self) -> bool:
         """
         :return: `True` if master copies and ERC20/721 are synced, `False` otherwise
@@ -96,26 +158,16 @@ class IndexService:
         reference_block_number = (
             self.ethereum_client.current_block_number - self.eth_reorg_blocks
         )
-        synced = True
+        synced: bool = True
         for safe_master_copy in SafeMasterCopy.objects.relevant().filter(
             tx_block_number__lt=reference_block_number
         ):
             logger.error("Master Copy %s is out of sync", safe_master_copy.address)
             synced = False
 
-        out_of_sync_contracts = SafeContract.objects.filter(
-            erc20_block_number__lt=reference_block_number
-        ).count()
-        if out_of_sync_contracts > 0:
-            total_number_of_contracts = SafeContract.objects.all().count()
-            proportion_out_of_sync = out_of_sync_contracts / total_number_of_contracts
-            # Ignore less than 10% of contracts out of sync
-            if proportion_out_of_sync >= self.alert_out_of_sync_events_threshold:
-                logger.error(
-                    "%d Safe Contracts have ERC20/721 out of sync",
-                    out_of_sync_contracts,
-                )
-                synced = False
+        if self.get_erc20_721_current_indexing_block_number() < reference_block_number:
+            logger.error("Safe Contracts have ERC20/721 out of sync")
+            synced = False
 
         return synced
 
@@ -161,8 +213,6 @@ class IndexService:
         ]
         if not tx_hashes_not_in_db:
             return list(ethereum_txs_dict.values())
-
-        self.ethereum_client = EthereumClientProvider()
 
         # Get receipts for hashes not in db
         tx_receipts = []
@@ -260,7 +310,9 @@ class IndexService:
             queryset.delete()
 
         logger.info("Remove transactions automatically indexed")
-        queryset = MultisigTransaction.objects.exclude(ethereum_tx=None)
+        queryset = MultisigTransaction.objects.exclude(ethereum_tx=None).filter(
+            Q(origin__exact={})
+        )
         if addresses:
             queryset = queryset.filter(safe__in=addresses)
         queryset.delete()
@@ -272,8 +324,13 @@ class IndexService:
         queryset.delete()
 
         logger.info("Remove Safe statuses")
-
         queryset = SafeStatus.objects.all()
+        if addresses:
+            queryset = queryset.filter(address__in=addresses)
+        queryset.delete()
+
+        logger.info("Remove Safe Last statuses")
+        queryset = SafeLastStatus.objects.all()
         if addresses:
             queryset = queryset.filter(address__in=addresses)
         queryset.delete()
@@ -300,38 +357,29 @@ class IndexService:
     def reprocess_all(self):
         return self._reprocess(None)
 
-    def reindex_master_copies(
+    def _reindex(
         self,
+        indexer: "EthereumIndexer",  # noqa F821
         from_block_number: int,
         to_block_number: Optional[int] = None,
         block_process_limit: int = 100,
         addresses: Optional[ChecksumAddress] = None,
-    ):
+    ) -> int:
         """
-        Reindexes master copies in parallel with the current running indexer, so service will have no missing txs
-        while reindexing
-
-        :param from_block_number: Block number to start indexing from
-        :param to_block_number: Block number to stop indexing on
-        :param block_process_limit: Number of blocks to process each time
-        :param addresses: Master Copy or Safes(for L2 event processing) addresses. If not provided,
-            all master copies will be used
+        :param provider:
+        :param from_block_number:
+        :param to_block_number:
+        :param block_process_limit:
+        :param addresses:
+        :return: Number of reindexed elements
         """
         assert (not to_block_number) or to_block_number > from_block_number
 
-        from ..indexers import (
-            EthereumIndexer,
-            InternalTxIndexerProvider,
-            SafeEventsIndexerProvider,
+        ignore_addresses_on_log_filter = (
+            indexer.IGNORE_ADDRESSES_ON_LOG_FILTER
+            if hasattr(indexer, "IGNORE_ADDRESSES_ON_LOG_FILTER")
+            else None
         )
-
-        indexer_provider = (
-            SafeEventsIndexerProvider
-            if self.eth_l2_network
-            else InternalTxIndexerProvider
-        )
-        indexer: EthereumIndexer = indexer_provider()
-        ethereum_client = EthereumClientProvider()
 
         if addresses:
             indexer.IGNORE_ADDRESSES_ON_LOG_FILTER = (
@@ -342,27 +390,99 @@ class IndexService:
                 indexer.database_queryset.values_list("address", flat=True)
             )
 
+        element_number: int = 0
         if not addresses:
             logger.warning("No addresses to process")
         else:
-            logger.info("Start reindexing Safe Master Copy addresses %s", addresses)
-            current_block_number = ethereum_client.current_block_number
+            logger.info("Start reindexing addresses %s", addresses)
+            current_block_number = self.ethereum_client.current_block_number
             stop_block_number = (
                 min(current_block_number, to_block_number)
                 if to_block_number
                 else current_block_number
             )
-            block_number = from_block_number
-            while block_number < stop_block_number:
+            for block_number in range(
+                from_block_number, stop_block_number, block_process_limit
+            ):
                 elements = indexer.find_relevant_elements(
-                    addresses, block_number, block_number + block_process_limit
+                    addresses,
+                    block_number,
+                    min(block_number + block_process_limit - 1, stop_block_number),
                 )
                 indexer.process_elements(elements)
-                block_number += block_process_limit
                 logger.info(
                     "Current block number %d, found %d traces/events",
                     block_number,
                     len(elements),
                 )
+                element_number += len(elements)
 
             logger.info("End reindexing addresses %s", addresses)
+
+        # We changed attributes on the indexer, so better restore it
+        indexer.IGNORE_ADDRESSES_ON_LOG_FILTER = ignore_addresses_on_log_filter
+        return element_number
+
+    def reindex_master_copies(
+        self,
+        from_block_number: int,
+        to_block_number: Optional[int] = None,
+        block_process_limit: int = 100,
+        addresses: Optional[ChecksumAddress] = None,
+    ) -> int:
+        """
+        Reindexes master copies in parallel with the current running indexer, so service will have no missing txs
+        while reindexing
+
+        :param from_block_number: Block number to start indexing from
+        :param to_block_number: Block number to stop indexing on
+        :param block_process_limit: Number of blocks to process each time
+        :param addresses: Master Copy or Safes(for L2 event processing) addresses. If not provided,
+            all master copies will be used
+        """
+
+        # TODO Refactor EthereumIndexer to fix circular imports
+        from ..indexers import InternalTxIndexerProvider, SafeEventsIndexerProvider
+
+        indexer = (
+            SafeEventsIndexerProvider
+            if self.eth_l2_network
+            else InternalTxIndexerProvider
+        )()
+
+        return self._reindex(
+            indexer,
+            from_block_number,
+            to_block_number=to_block_number,
+            block_process_limit=block_process_limit,
+            addresses=addresses,
+        )
+
+    def reindex_erc20_events(
+        self,
+        from_block_number: int,
+        to_block_number: Optional[int] = None,
+        block_process_limit: int = 100,
+        addresses: Optional[ChecksumAddress] = None,
+    ) -> int:
+        """
+        Reindexes erc20/721 events parallel with the current running indexer, so service will have no missing
+        events while reindexing
+
+        :param from_block_number: Block number to start indexing from
+        :param to_block_number: Block number to stop indexing on
+        :param block_process_limit: Number of blocks to process each time
+        :param addresses: Safe addresses. If not provided, all Safe addresses will be used
+        """
+        assert (not to_block_number) or to_block_number > from_block_number
+
+        from ..indexers import Erc20EventsIndexerProvider
+
+        indexer = Erc20EventsIndexerProvider()
+        return self._reindex(
+            indexer,
+            from_block_number,
+            to_block_number=to_block_number,
+            block_process_limit=block_process_limit,
+            addresses=addresses,
+        )

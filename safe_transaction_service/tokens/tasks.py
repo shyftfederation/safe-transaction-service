@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Optional
 
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 
 from celery import app
@@ -10,18 +11,20 @@ from celery.utils.log import get_task_logger
 from eth_typing import ChecksumAddress
 
 from gnosis.eth.ethereum_client import EthereumNetwork
+from gnosis.eth.utils import fast_to_checksum_address
 
 from safe_transaction_service.utils.ethereum import get_ethereum_network
 from safe_transaction_service.utils.redis import get_redis
 from safe_transaction_service.utils.utils import close_gevent_db_connection_decorator
 
-from .models import Token
+from .exceptions import TokenListRetrievalException
+from .models import Token, TokenList
 
 logger = get_task_logger(__name__)
 
 
 @dataclass
-class EthValueWithTimestamp(object):
+class EthValueWithTimestamp:
     """
     Contains ethereum value for a token and the timestamp on when it was calculated
     """
@@ -63,36 +66,38 @@ def calculate_token_eth_price_task(
     )  # Expire in 15 minutes
     if key_was_set or force_recalculation:
         price_service = PriceServiceProvider()
-        eth_price = (
-            price_service.get_token_eth_value(token_address)
-            or price_service.get_token_usd_price(token_address)
-            / price_service.get_native_coin_usd_price()
-        )
-        if not eth_price:  # Try composed oracles
-            if underlying_tokens := price_service.get_underlying_tokens(token_address):
-                eth_price = 0
-                for underlying_token in underlying_tokens:
-                    # Find underlying token price and multiply by quantity
-                    address = underlying_token.address
-                    eth_price += (
-                        calculate_token_eth_price_task(
-                            address,
-                            f"price-service:{address}:eth-price",  # TODO Refactor all the calculation logic
-                        ).eth_value
-                        * underlying_token.quantity
-                    )
-        if eth_price:
-            eth_value_with_timestamp = EthValueWithTimestamp(eth_price, now)
-            redis.setex(redis_key, redis_expiration_time, str(eth_value_with_timestamp))
-            if not getattr(settings, "CELERY_ALWAYS_EAGER", False):
-                # Recalculate price before cache expires and prevents recursion checking Celery Eager property
-                calculate_token_eth_price_task.apply_async(
-                    (token_address, redis_key),
-                    {"force_recalculation": True},
-                    countdown=redis_expiration_time - 300,
-                )
-        else:
-            logger.warning("Cannot calculate eth price for token=%s", token_address)
+        eth_price = price_service.get_token_eth_price_from_oracles(token_address)
+        if not eth_price:
+            eth_price = price_service.get_token_eth_price_from_composed_oracles(
+                token_address
+            )
+
+        logger.debug("Calculated eth-price=%f for token=%s", eth_price, token_address)
+        if not eth_price:
+            logger.warning(
+                "Cannot calculate eth price for token=%s - Trying to use previous price",
+                token_address,
+            )
+            last_redis_value = redis.get(redis_key)
+            if last_redis_value:
+                logger.warning("Using previous eth price for token=%s", token_address)
+                eth_price = EthValueWithTimestamp.from_string(
+                    last_redis_value.decode()
+                ).eth_value
+            else:
+                logger.warning("Cannot calculate eth price for token=%s", token_address)
+                return EthValueWithTimestamp(eth_price, now)
+
+        eth_value_with_timestamp = EthValueWithTimestamp(eth_price, now)
+        redis.setex(redis_key, redis_expiration_time, str(eth_value_with_timestamp))
+        if not getattr(settings, "CELERY_ALWAYS_EAGER", False):
+            # Recalculate price before cache expires and prevents recursion checking Celery Eager property
+            calculate_token_eth_price_task.apply_async(
+                (token_address, redis_key),
+                {"force_recalculation": True},
+                countdown=redis_expiration_time - 300,
+            )
+
         return EthValueWithTimestamp(eth_price, now)
     else:
         return EthValueWithTimestamp.from_string(redis.get(redis_key).decode())
@@ -115,17 +120,32 @@ def fix_pool_tokens_task() -> Optional[int]:
 
 @app.shared_task()
 @close_gevent_db_connection_decorator
-def get_token_info_from_blockchain_task(token_address: ChecksumAddress) -> bool:
+def update_token_info_from_token_list_task() -> int:
     """
-    Retrieve token information from blockchain
+    If there's at least one valid token list with at least 1 token, every token in the DB is marked as `not trusted`
+    and then every token on the list is marked as `trusted`
 
-    :param token_address:
-    :return: `True` if found, `False` otherwise
+    :return: Number of tokens marked as `trusted`
     """
-    redis = get_redis()
-    key = f"token-task:{token_address}"
-    if result := redis.get(key):
-        return bool(int(result))
-    token_found = bool(Token.objects.create_from_blockchain(token_address))
-    redis.setex(key, 60 * 60 * 6, int(token_found))  # Cache result 6 hours
-    return token_found
+    tokens = []
+    for token_list in TokenList.objects.all():
+        try:
+            tokens += token_list.get_tokens()
+        except TokenListRetrievalException:
+            logger.error("Cannot read tokens from %s", token_list)
+
+    if not tokens:
+        return 0
+
+    # Make sure current chainId matches the one in the list
+    ethereum_network = get_ethereum_network()
+
+    token_addresses = [
+        fast_to_checksum_address(token["address"])
+        for token in tokens
+        if token["chainId"] == ethereum_network.value
+    ]
+
+    with transaction.atomic():
+        Token.objects.update(trusted=False)
+        return Token.objects.filter(address__in=token_addresses).update(trusted=True)

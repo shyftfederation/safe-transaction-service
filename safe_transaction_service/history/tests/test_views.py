@@ -1,7 +1,8 @@
+import json
 import logging
 from dataclasses import asdict
 from unittest import mock
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, PropertyMock
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
@@ -16,7 +17,8 @@ from rest_framework.test import APIRequestFactory, APITestCase, force_authentica
 from web3 import Web3
 
 from gnosis.eth.constants import NULL_ADDRESS
-from gnosis.eth.ethereum_client import ParityManager
+from gnosis.eth.ethereum_client import EthereumClient, ParityManager
+from gnosis.eth.utils import fast_is_checksum_address
 from gnosis.safe import CannotEstimateGas, Safe, SafeOperation
 from gnosis.safe.safe_signature import SafeSignature, SafeSignatureType
 from gnosis.safe.signatures import signature_to_bytes
@@ -29,13 +31,17 @@ from safe_transaction_service.tokens.models import Token
 from safe_transaction_service.tokens.services.price_service import PriceService
 from safe_transaction_service.tokens.tests.factories import TokenFactory
 
-from ..exceptions import NodeConnectionException
 from ..helpers import DelegateSignatureHelper
-from ..models import MultisigConfirmation, MultisigTransaction, SafeContractDelegate
-from ..serializers import DelegateSerializer, TransferType
-from ..services import BalanceService, CollectiblesService, SafeService
+from ..models import (
+    IndexingStatus,
+    MultisigConfirmation,
+    MultisigTransaction,
+    SafeContractDelegate,
+    SafeMasterCopy,
+)
+from ..serializers import TransferType
+from ..services import BalanceService
 from ..services.balance_service import Erc20InfoWithLogo
-from ..services.collectibles_service import CollectibleWithMetadata
 from ..views import SafeMultisigTransactionListView
 from .factories import (
     ERC20TransferFactory,
@@ -47,6 +53,7 @@ from .factories import (
     MultisigTransactionFactory,
     SafeContractDelegateFactory,
     SafeContractFactory,
+    SafeLastStatusFactory,
     SafeMasterCopyFactory,
     SafeStatusFactory,
 )
@@ -75,6 +82,96 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 self.assertEqual(response.data["chain_id"], 1337)
                 self.assertEqual(response.data["chain"], "GANACHE")
                 self.assertEqual(response.data["syncing"], False)
+
+    @mock.patch.object(
+        EthereumClient,
+        "current_block_number",
+        new_callable=PropertyMock,
+        return_value=2_000,
+    )
+    def test_indexing_view(self, current_block_number_mock: PropertyMock):
+        IndexingStatus.objects.set_erc20_721_indexing_status(2_005)
+        url = reverse("v1:history:indexing")
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["current_block_number"], 2_000)
+        self.assertEqual(response.data["erc20_block_number"], 2_000)
+        self.assertEqual(response.data["erc20_synced"], True)
+        self.assertEqual(response.data["master_copies_block_number"], 2_000)
+        self.assertEqual(response.data["master_copies_synced"], True)
+        self.assertEqual(response.data["synced"], True)
+
+        IndexingStatus.objects.set_erc20_721_indexing_status(500)
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["current_block_number"], 2000)
+        self.assertEqual(response.data["erc20_block_number"], 499)
+        self.assertEqual(response.data["erc20_synced"], False)
+        self.assertEqual(response.data["master_copies_block_number"], 2000)
+        self.assertEqual(response.data["master_copies_synced"], True)
+        self.assertEqual(response.data["synced"], False)
+
+        safe_master_copy = SafeMasterCopyFactory(tx_block_number=2000)
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["current_block_number"], 2000)
+        self.assertEqual(response.data["erc20_block_number"], 499)
+        self.assertEqual(response.data["erc20_synced"], False)
+        self.assertEqual(response.data["master_copies_block_number"], 1999)
+        self.assertEqual(response.data["master_copies_synced"], True)
+        self.assertEqual(response.data["synced"], False)
+
+        safe_master_copy.tx_block_number = 600
+        safe_master_copy.save(update_fields=["tx_block_number"])
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.data["current_block_number"], 2000)
+        self.assertEqual(response.data["erc20_block_number"], 499)
+        self.assertEqual(response.data["erc20_synced"], False)
+        self.assertEqual(response.data["master_copies_block_number"], 599)
+        self.assertEqual(response.data["master_copies_synced"], False)
+        self.assertEqual(response.data["synced"], False)
+
+        IndexingStatus.objects.set_erc20_721_indexing_status(10)
+        SafeMasterCopyFactory(tx_block_number=8)
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["current_block_number"], 2000)
+        self.assertEqual(response.data["erc20_block_number"], 9)
+        self.assertEqual(response.data["erc20_synced"], False)
+        self.assertEqual(response.data["master_copies_block_number"], 7)
+        self.assertEqual(response.data["master_copies_synced"], False)
+        self.assertEqual(response.data["synced"], False)
+
+        SafeMasterCopyFactory(tx_block_number=11)
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["current_block_number"], 2000)
+        self.assertEqual(response.data["erc20_block_number"], 9)
+        self.assertEqual(response.data["erc20_synced"], False)
+        self.assertEqual(response.data["master_copies_block_number"], 7)
+        self.assertEqual(response.data["master_copies_synced"], False)
+        self.assertEqual(response.data["synced"], False)
+
+        IndexingStatus.objects.set_erc20_721_indexing_status(2_000)
+        SafeMasterCopy.objects.update(tx_block_number=2_000)
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["current_block_number"], 2000)
+        self.assertEqual(response.data["erc20_block_number"], 1999)
+        self.assertEqual(response.data["erc20_synced"], True)
+        self.assertEqual(response.data["master_copies_block_number"], 1999)
+        self.assertEqual(response.data["master_copies_synced"], True)
+        self.assertEqual(response.data["synced"], True)
+
+        SafeMasterCopyFactory(tx_block_number=48)
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["current_block_number"], 2000)
+        self.assertEqual(response.data["erc20_block_number"], 1999)
+        self.assertEqual(response.data["erc20_synced"], True)
+        self.assertEqual(response.data["master_copies_block_number"], 47)
+        self.assertEqual(response.data["master_copies_synced"], False)
+        self.assertEqual(response.data["synced"], False)
 
     def test_all_transactions_view(self):
         safe_address = Account.create().address
@@ -502,12 +599,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data["confirmations"]), 0)
-        self.assertTrue(Web3.isChecksumAddress(response.data["executor"]))
+        self.assertTrue(fast_is_checksum_address(response.data["executor"]))
         self.assertEqual(
             response.data["transaction_hash"], multisig_tx.ethereum_tx.tx_hash
         )
         self.assertEqual(response.data["origin"], multisig_tx.origin)
         self.assertFalse(response.data["trusted"])
+        self.assertIsNone(response.data["max_fee_per_gas"])
+        self.assertIsNone(response.data["max_priority_fee_per_gas"])
         self.assertEqual(
             response.data["data_decoded"],
             {
@@ -526,6 +625,28 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(
             response.json()["transactionHash"], multisig_tx.ethereum_tx.tx_hash
         )
+        # Test empty origin object
+        multisig_tx.origin = {}
+        multisig_tx.save(update_fields=["origin"])
+        response = self.client.get(
+            reverse("v1:history:multisig-transaction", args=(safe_tx_hash,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["origin"], json.dumps({}))
+        self.assertEqual(json.loads(response.data["origin"]), {})
+
+        # Test origin object
+        origin = {"app": "Testing App", "name": "Testing"}
+        multisig_tx.origin = origin
+        multisig_tx.save(update_fields=["origin"])
+        response = self.client.get(
+            reverse("v1:history:multisig-transaction", args=(safe_tx_hash,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["origin"], json.dumps(origin))
+        self.assertEqual(json.loads(response.data["origin"]), origin)
 
     def test_get_multisig_transactions(self):
         safe_address = Account.create().address
@@ -546,7 +667,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["count_unique_nonce"], 1)
         self.assertEqual(len(response.data["results"]), 1)
         self.assertEqual(len(response.data["results"][0]["confirmations"]), 0)
-        self.assertTrue(Web3.isChecksumAddress(response.data["results"][0]["executor"]))
+        self.assertTrue(
+            fast_is_checksum_address(response.data["results"][0]["executor"])
+        )
         self.assertEqual(
             response.data["results"][0]["transaction_hash"],
             multisig_tx.ethereum_tx.tx_hash,
@@ -1132,6 +1255,31 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             safe_tx_hash=safe_tx.safe_tx_hash
         )
         self.assertEqual(multisig_tx_db.origin, data["origin"])
+        data["origin"] = '{"url": "test", "name":"test"}'
+        data["nonce"] = 1
+        safe_tx = safe.build_multisig_tx(
+            data["to"],
+            data["value"],
+            data["data"],
+            data["operation"],
+            data["safeTxGas"],
+            data["baseGas"],
+            data["gasPrice"],
+            data["gasToken"],
+            data["refundReceiver"],
+            safe_nonce=data["nonce"],
+        )
+        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        response = self.client.post(
+            reverse("v1:history:multisig-transactions", args=(safe_address,)),
+            format="json",
+            data=data,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        multisig_tx_db = MultisigTransaction.objects.get(
+            safe_tx_hash=safe_tx.safe_tx_hash
+        )
+        self.assertEqual(multisig_tx_db.origin, json.loads(data["origin"]))
 
     def test_post_multisig_transactions_with_multiple_signatures(self):
         safe_owners = [Account.create() for _ in range(4)]
@@ -1465,70 +1613,6 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             ],
         )
 
-    def test_safe_collectibles(self):
-        safe_address = Account.create().address
-        response = self.client.get(
-            reverse("v1:history:safe-collectibles", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-
-        SafeContractFactory(address=safe_address)
-        response = self.client.get(
-            reverse("v1:history:safe-collectibles", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 0)
-
-        with mock.patch.object(
-            CollectiblesService, "get_collectibles_with_metadata", autospec=True
-        ) as function:
-            token_name = "TokenName"
-            token_symbol = "SYMBOL"
-            token_address = Account.create().address
-            logo_uri = f"http://token.org/{token_address}.png"
-            token_id = 54
-            token_uri = f"http://token.org/token-id/{token_id}"
-            image = "http://token.org/token-id/1/image"
-            name = "Test token name"
-            description = "Test token description"
-            function.return_value = [
-                CollectibleWithMetadata(
-                    token_name,
-                    token_symbol,
-                    logo_uri,
-                    token_address,
-                    token_id,
-                    token_uri,
-                    {"image": image, "name": name, "description": description},
-                )
-            ]
-            response = self.client.get(
-                reverse("v1:history:safe-collectibles", args=(safe_address,)),
-                format="json",
-            )
-            self.assertEqual(response.status_code, status.HTTP_200_OK)
-            self.assertEqual(
-                response.data,
-                [
-                    {
-                        "address": token_address,
-                        "token_name": token_name,
-                        "token_symbol": token_symbol,
-                        "logo_uri": logo_uri,
-                        "id": str(token_id),
-                        "uri": token_uri,
-                        "name": name,
-                        "description": description,
-                        "image_uri": image,
-                        "metadata": {
-                            "image": image,
-                            "name": name,
-                            "description": description,
-                        },
-                    }
-                ],
-            )
-
     def test_get_safe_delegate_list(self):
         safe_address = Account.create().address
         response = self.client.get(
@@ -1773,10 +1857,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
         SafeContractFactory(address=safe_address)
-        with mock.patch.object(
-            DelegateSerializer,
-            "get_safe_owners",
-            autospec=True,
+        with mock.patch(
+            "safe_transaction_service.history.serializers.get_safe_owners",
             return_value=[Account.create().address],
         ) as get_safe_owners_mock:
             response = self.client.post(url, format="json", data=data)
@@ -1980,10 +2062,25 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )  # Data is missing
 
         data = {
-            # 'delegate': delegate_address,
-            "signature": "0x"
-            + "1" * 130,
+            "delegate": Account.create().address,
+            "signature": "0x" + "1" * 130,
         }
+        response = self.client.delete(
+            reverse("v1:history:safe-delegate", args=(safe_address, delegate_address)),
+            format="json",
+            data=data,
+        )
+        self.assertEqual(
+            {
+                "code": 2,
+                "message": "Delegate address in body should match the one in the url",
+                "arguments": [data["delegate"], delegate_address],
+            },
+            response.data,
+        )
+        self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+        del data["delegate"]
         response = self.client.delete(
             reverse("v1:history:safe-delegate", args=(safe_address, delegate_address)),
             format="json",
@@ -2680,8 +2777,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
 
-        safe = self.deploy_test_safe()
-        safe_address = safe.address
+        safe_address = Account.create().address
         response = self.client.get(
             reverse("v1:history:safe-info", args=(safe_address,))
         )
@@ -2691,38 +2787,145 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         response = self.client.get(
             reverse("v1:history:safe-info", args=(safe_address,)), format="json"
         )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
         self.assertEqual(
             response.data,
             {
-                "address": safe_address,
+                "code": 50,
+                "message": "Cannot get Safe info from blockchain",
+                "arguments": [safe_address],
+            },
+        )
+
+        safe_last_status = SafeLastStatusFactory(address=safe_address, nonce=0)
+        # For nonce=0, try to get info from blockchain
+        response = self.client.get(
+            reverse("v1:history:safe-info", args=(safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
+        self.assertEqual(
+            response.data,
+            {
+                "code": 50,
+                "message": "Cannot get Safe info from blockchain",
+                "arguments": [safe_address],
+            },
+        )
+
+        # Test blockchain Safe
+        blockchain_safe = self.deploy_test_safe()
+        response = self.client.get(
+            reverse("v1:history:safe-info", args=(blockchain_safe.address,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+        SafeContractFactory(address=blockchain_safe.address)
+        SafeMasterCopyFactory(
+            address=blockchain_safe.retrieve_master_copy_address(), version="1.25.0"
+        )
+        response = self.client.get(
+            reverse("v1:history:safe-info", args=(blockchain_safe.address,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.assertEqual(
+            response.data,
+            {
+                "address": blockchain_safe.address,
                 "nonce": 0,
-                "threshold": safe.retrieve_threshold(),
-                "owners": safe.retrieve_owners(),
-                "master_copy": safe.retrieve_master_copy_address(),
+                "threshold": blockchain_safe.retrieve_threshold(),
+                "owners": blockchain_safe.retrieve_owners(),
+                "master_copy": blockchain_safe.retrieve_master_copy_address(),
                 "modules": [],
-                "fallback_handler": safe.retrieve_fallback_handler(),
+                "fallback_handler": blockchain_safe.retrieve_fallback_handler(),
+                "guard": NULL_ADDRESS,
+                "version": "1.25.0",
+            },
+        )
+
+        # Uncomment if this method is used again on `SafeInfoView`
+        """
+        with mock.patch.object(SafeService, "get_safe_info") as get_safe_info_mock:
+            safe_info_mock = SafeInfo(
+                safe_address,
+                Account.create().address,
+                Account.create().address,
+                Account.create().address,
+                [Account.create().address],
+                5,
+                [Account.create().address, Account.create().address],
+                1,
+                "1.3.0",
+            )
+            get_safe_info_mock.return_value = safe_info_mock
+            response = self.client.get(
+                reverse("v1:history:safe-info", args=(safe_address,)), format="json"
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertDictEqual(
+                response.data,
+                {
+                    "address": safe_address,
+                    "nonce": safe_info_mock.nonce,
+                    "threshold": safe_info_mock.threshold,
+                    "owners": safe_info_mock.owners,
+                    "master_copy": safe_info_mock.master_copy,
+                    "modules": safe_info_mock.modules,
+                    "fallback_handler": safe_info_mock.fallback_handler,
+                    "guard": safe_info_mock.guard,
+                    "version": "1.3.0",
+                },
+            )
+
+        safe_last_status.nonce = 1
+        safe_last_status.save(update_fields=["nonce"])
+        response = self.client.get(
+            reverse("v1:history:safe-info", args=(safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertDictEqual(
+            response.data,
+            {
+                "address": safe_address,
+                "nonce": safe_last_status.nonce,
+                "threshold": safe_last_status.threshold,
+                "owners": safe_last_status.owners,
+                "master_copy": safe_last_status.master_copy,
+                "modules": safe_last_status.enabled_modules,
+                "fallback_handler": safe_last_status.fallback_handler,
+                "guard": safe_last_status.guard,
+                "version": None,
+            },
+        )
+
+        SafeMasterCopyFactory(address=safe_last_status.master_copy, version="1.3.0")
+        response = self.client.get(
+            reverse("v1:history:safe-info", args=(safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertDictEqual(
+            response.data,
+            {
+                "address": safe_address,
+                "nonce": safe_last_status.nonce,
+                "threshold": safe_last_status.threshold,
+                "owners": safe_last_status.owners,
+                "master_copy": safe_last_status.master_copy,
+                "modules": safe_last_status.enabled_modules,
+                "fallback_handler": safe_last_status.fallback_handler,
                 "guard": NULL_ADDRESS,
                 "version": "1.3.0",
             },
         )
-
-        with mock.patch.object(
-            SafeService,
-            "get_safe_info",
-            side_effect=NodeConnectionException,
-            autospec=True,
-        ):
-            response = self.client.get(
-                reverse("v1:history:safe-info", args=(safe_address,)), format="json"
-            )
-            self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        """
+        SafeMasterCopy.objects.get_version_for_address.cache_clear()
 
     def test_master_copies_view(self):
         response = self.client.get(reverse("v1:history:master-copies"))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected = []
-        self.assertEqual(response.data, expected)
+        self.assertEqual(response.data, [])
 
         deployed_block_number = 2
         last_indexed_block_number = 5
@@ -2732,7 +2935,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         response = self.client.get(reverse("v1:history:master-copies"))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected = [
+        expected_master_copy = [
             {
                 "address": safe_master_copy.address,
                 "version": safe_master_copy.version,
@@ -2742,12 +2945,12 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "l2": False,
             }
         ]
-        self.assertCountEqual(response.data, expected)
+        self.assertCountEqual(response.data, expected_master_copy)
 
         safe_master_copy = SafeMasterCopyFactory(l2=True)
         response = self.client.get(reverse("v1:history:master-copies"))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected += [
+        expected_l2_master_copy = [
             {
                 "address": safe_master_copy.address,
                 "version": safe_master_copy.version,
@@ -2758,165 +2961,44 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             }
         ]
 
-        self.assertCountEqual(response.data, expected)
+        self.assertCountEqual(
+            response.data, expected_master_copy + expected_l2_master_copy
+        )
 
-    def test_analytics_multisig_txs_by_origin_view(self):
+        with self.settings(ETH_L2_NETWORK=True):
+            response = self.client.get(reverse("v1:history:master-copies"))
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertCountEqual(response.data, expected_l2_master_copy)
+
+    def test_modules_view(self):
+        invalid_address = "0x2A"
         response = self.client.get(
-            reverse("v1:history:analytics-multisig-txs-by-origin")
+            reverse("v1:history:modules", args=(invalid_address,))
         )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
 
-        origin = "Millennium Falcon Navigation Computer"
-        origin_2 = "HAL 9000"
-        multisig_transaction = MultisigTransactionFactory(origin=origin)
+        module_address = Account.create().address
         response = self.client.get(
-            reverse("v1:history:analytics-multisig-txs-by-origin")
+            reverse("v1:history:modules", args=(module_address,))
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected = [
-            {"origin": origin, "transactions": 1},
-        ]
-        self.assertEqual(response.data, expected)
+        self.assertEqual(response.data["safes"], [])
 
-        for _ in range(3):
-            MultisigTransactionFactory(origin=origin_2)
-
+        safe_last_status = SafeLastStatusFactory(enabled_modules=[module_address])
         response = self.client.get(
-            reverse("v1:history:analytics-multisig-txs-by-origin")
+            reverse("v1:history:modules", args=(module_address,)), format="json"
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected = [
-            {"origin": origin_2, "transactions": 3},
-            {"origin": origin, "transactions": 1},
-        ]
-        self.assertEqual(response.data, expected)
+        self.assertEqual(response.data["safes"], [safe_last_status.address])
 
-        for _ in range(3):
-            MultisigTransactionFactory(origin=origin)
-
-        # Check sorting by the biggest
+        safe_status_2 = SafeLastStatusFactory(enabled_modules=[module_address])
+        SafeStatusFactory()  # Test that other SafeStatus don't appear
         response = self.client.get(
-            reverse("v1:history:analytics-multisig-txs-by-origin")
+            reverse("v1:history:modules", args=(module_address,)), format="json"
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected = [
-            {"origin": origin, "transactions": 4},
-            {"origin": origin_2, "transactions": 3},
-        ]
-        self.assertEqual(response.data, expected)
-
-        # Test filters
-        origin_3 = "Skynet"
-        safe_address = Account.create().address
-        MultisigTransactionFactory(origin=origin_3, safe=safe_address)
-        response = self.client.get(
-            reverse("v1:history:analytics-multisig-txs-by-origin")
-            + f"?safe={safe_address}"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected = [
-            {"origin": origin_3, "transactions": 1},
-        ]
-        self.assertEqual(response.data, expected)
-
-        response = self.client.get(
-            reverse("v1:history:analytics-multisig-txs-by-origin")
-            + f"?to={multisig_transaction.to}"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected = [
-            {"origin": multisig_transaction.origin, "transactions": 1},
-        ]
-        self.assertEqual(response.data, expected)
-
-    def test_analytics_multisig_txs_by_safe_view(self):
-        response = self.client.get(reverse("v1:history:analytics-multisig-txs-by-safe"))
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        safe_address_1 = Account.create().address
-        safe_address_2 = Account.create().address
-        safe_address_3 = Account.create().address
-        MultisigTransactionFactory(safe=safe_address_1)
-        MultisigTransactionFactory(safe=safe_address_1)
-        response = self.client.get(reverse("v1:history:analytics-multisig-txs-by-safe"))
-        result = response.json()
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(result["count"], 1)
-        self.assertEqual(
-            result["results"][0],
-            {"safe": safe_address_1, "masterCopy": None, "transactions": 2},
-        )
-        MultisigTransactionFactory(safe=safe_address_1)
-        safe_status_1 = SafeStatusFactory(address=safe_address_1)
-        response = self.client.get(reverse("v1:history:analytics-multisig-txs-by-safe"))
-        result = response.json()
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(result["count"], 1)
-        self.assertIsNotNone(safe_status_1.master_copy)
-        self.assertEqual(
-            result["results"][0],
-            {
-                "safe": safe_address_1,
-                "masterCopy": safe_status_1.master_copy,
-                "transactions": 3,
-            },
-        )
-        MultisigTransactionFactory(safe=safe_address_2)
-        response = self.client.get(reverse("v1:history:analytics-multisig-txs-by-safe"))
-        result = response.json()
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(
-            result["results"],
-            [
-                {
-                    "safe": safe_address_1,
-                    "masterCopy": safe_status_1.master_copy,
-                    "transactions": 3,
-                },
-                {"safe": safe_address_2, "masterCopy": None, "transactions": 1},
-            ],
-        )
-        safe_status_2 = SafeStatusFactory(address=safe_address_2)
-        safe_status_3 = SafeStatusFactory(address=safe_address_3)
-        [MultisigTransactionFactory(safe=safe_address_3) for _ in range(4)]
-        response = self.client.get(reverse("v1:history:analytics-multisig-txs-by-safe"))
-        result = response.json()
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(
-            result["results"],
-            [
-                {
-                    "safe": safe_address_3,
-                    "masterCopy": safe_status_3.master_copy,
-                    "transactions": 4,
-                },
-                {
-                    "safe": safe_address_1,
-                    "masterCopy": safe_status_1.master_copy,
-                    "transactions": 3,
-                },
-                {
-                    "safe": safe_address_2,
-                    "masterCopy": safe_status_2.master_copy,
-                    "transactions": 1,
-                },
-            ],
-        )
-
-        response = self.client.get(
-            reverse("v1:history:analytics-multisig-txs-by-safe")
-            + f"?master_copy={safe_status_1.master_copy}"
-        )
-        result = response.json()
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(
-            result["results"],
-            [
-                {
-                    "safe": safe_address_1,
-                    "masterCopy": safe_status_1.master_copy,
-                    "transactions": 3,
-                },
-            ],
+        self.assertCountEqual(
+            response.data["safes"], [safe_last_status.address, safe_status_2.address]
         )
 
     def test_owners_view(self):
@@ -2931,21 +3013,21 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["safes"], [])
 
-        safe_status = SafeStatusFactory(owners=[owner_address])
+        safe_last_status = SafeLastStatusFactory(owners=[owner_address])
         response = self.client.get(
             reverse("v1:history:owners", args=(owner_address,)), format="json"
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["safes"], [safe_status.address])
+        self.assertEqual(response.data["safes"], [safe_last_status.address])
 
-        safe_status_2 = SafeStatusFactory(owners=[owner_address])
+        safe_status_2 = SafeLastStatusFactory(owners=[owner_address])
         SafeStatusFactory()  # Test that other SafeStatus don't appear
         response = self.client.get(
             reverse("v1:history:owners", args=(owner_address,)), format="json"
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertCountEqual(
-            response.data["safes"], [safe_status.address, safe_status_2.address]
+            response.data["safes"], [safe_last_status.address, safe_status_2.address]
         )
 
     def test_data_decoder_view(self):

@@ -8,7 +8,25 @@ from django.db import connection
 from gevent.monkey import saved
 
 
-def chunks(elements: List[Any], n: int):
+class FixedSizeDict(dict):
+    """
+    Fixed size dictionary to be used as an LRU cache
+
+    Dictionaries are guaranteed to be insertion sorted from Python 3.7 onwards
+    """
+
+    def __init__(self, *args, maxlen=0, **kwargs):
+        self._maxlen = maxlen
+        super().__init__(*args, **kwargs)
+
+    def __setitem__(self, key, value):
+        dict.__setitem__(self, key, value)
+        if self._maxlen > 0:
+            if len(self) > self._maxlen:
+                self.pop(next(iter(self)))
+
+
+def chunks(elements: List[Any], n: int) -> Iterable[Any]:
     """
     :param elements: List
     :param n: Number of elements per chunk

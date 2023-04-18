@@ -1,3 +1,4 @@
+import json
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -5,7 +6,6 @@ from drf_yasg.utils import swagger_serializer_method
 from eth_typing import ChecksumAddress
 from rest_framework import serializers
 from rest_framework.exceptions import NotFound, ValidationError
-from web3.exceptions import BadFunctionCallOutput
 
 from gnosis.eth import EthereumClient, EthereumClientProvider
 from gnosis.eth.django.models import EthereumAddressV2Field as EthereumAddressDbField
@@ -24,6 +24,7 @@ from safe_transaction_service.contracts.tx_decoder import (
     get_db_tx_decoder,
 )
 from safe_transaction_service.tokens.serializers import TokenInfoResponseSerializer
+from safe_transaction_service.utils.serializers import get_safe_owners, get_safe_version
 
 from .exceptions import NodeConnectionException
 from .helpers import DelegateSignatureHelper
@@ -67,10 +68,10 @@ class SafeMultisigConfirmationSerializer(serializers.Serializer):
             multisig_transaction = MultisigTransaction.objects.select_related(
                 "ethereum_tx"
             ).get(safe_tx_hash=safe_tx_hash)
-        except MultisigTransaction.DoesNotExist:
+        except MultisigTransaction.DoesNotExist as exc:
             raise NotFound(
                 f"Multisig transaction with safe-tx-hash={safe_tx_hash} was not found"
-            )
+            ) from exc
 
         safe_address = multisig_transaction.safe
         if multisig_transaction.executed:
@@ -78,22 +79,17 @@ class SafeMultisigConfirmationSerializer(serializers.Serializer):
                 f"Transaction with safe-tx-hash={safe_tx_hash} was already executed"
             )
 
-        ethereum_client = EthereumClientProvider()
-        safe = Safe(safe_address, ethereum_client)
-        try:
-            safe_owners = safe.retrieve_owners(block_identifier="pending")
-        except BadFunctionCallOutput:  # Error using pending block identifier
-            safe_owners = safe.retrieve_owners(block_identifier="latest")
-
+        safe_owners = get_safe_owners(safe_address)
         parsed_signatures = SafeSignature.parse_signature(signature, safe_tx_hash)
         signature_owners = []
+        ethereum_client = EthereumClientProvider()
         for safe_signature in parsed_signatures:
             owner = safe_signature.owner
             if owner not in safe_owners:
                 raise ValidationError(
                     f"Signer={owner} is not an owner. Current owners={safe_owners}"
                 )
-            if not safe_signature.is_valid(ethereum_client, safe.address):
+            if not safe_signature.is_valid(ethereum_client, safe_address):
                 raise ValidationError(
                     f"Signature={safe_signature.signature.hex()} for owner={owner} is not valid"
                 )
@@ -136,98 +132,92 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializerV1):
     )  # Signatures must be at least 65 bytes
     origin = serializers.CharField(max_length=200, allow_null=True, default=None)
 
-    def validate(self, data):
-        super().validate(data)
+    def validate_origin(self, origin):
+        # Origin field on db is a JsonField
+        if origin:
+            try:
+                origin = json.loads(origin)
+            except ValueError:
+                pass
+        else:
+            origin = {}
+
+        return origin
+
+    def validate(self, attrs):
+        super().validate(attrs)
 
         ethereum_client = EthereumClientProvider()
-        safe = Safe(data["safe"], ethereum_client)
-        try:
-            safe_version = safe.retrieve_version()
-        except BadFunctionCallOutput as e:
-            raise ValidationError(
-                f"Could not get Safe version from blockchain, check contract exists on network "
-                f"{ethereum_client.get_network().name}"
-            ) from e
-        except IOError:
-            raise ValidationError(
-                "Problem connecting to the ethereum node, please try again later"
-            )
+        safe_address = attrs["safe"]
+        safe_version = get_safe_version(safe_address)
 
+        safe = Safe(safe_address, EthereumClientProvider())
         safe_tx = safe.build_multisig_tx(
-            data["to"],
-            data["value"],
-            data["data"],
-            data["operation"],
-            data["safe_tx_gas"],
-            data["base_gas"],
-            data["gas_price"],
-            data["gas_token"],
-            data["refund_receiver"],
-            safe_nonce=data["nonce"],
+            attrs["to"],
+            attrs["value"],
+            attrs["data"],
+            attrs["operation"],
+            attrs["safe_tx_gas"],
+            attrs["base_gas"],
+            attrs["gas_price"],
+            attrs["gas_token"],
+            attrs["refund_receiver"],
+            safe_nonce=attrs["nonce"],
             safe_version=safe_version,
         )
         contract_transaction_hash = safe_tx.safe_tx_hash
 
         # Check safe tx hash matches
-        if contract_transaction_hash != data["contract_transaction_hash"]:
+        if contract_transaction_hash != attrs["contract_transaction_hash"]:
             raise ValidationError(
                 f"Contract-transaction-hash={contract_transaction_hash.hex()} "
-                f'does not match provided contract-tx-hash={data["contract_transaction_hash"].hex()}'
+                f'does not match provided contract-tx-hash={attrs["contract_transaction_hash"].hex()}'
             )
 
         # Check there's not duplicated tx with same `nonce` or same `safeTxHash` for the same Safe.
         # We allow duplicated if existing tx is not executed
         multisig_transactions = MultisigTransaction.objects.filter(
-            safe=safe.address, nonce=data["nonce"]
+            safe=safe_address, nonce=attrs["nonce"]
         ).executed()
         if multisig_transactions:
             for multisig_transaction in multisig_transactions:
                 if multisig_transaction.safe_tx_hash == contract_transaction_hash.hex():
                     raise ValidationError(
                         f"Tx with safe-tx-hash={contract_transaction_hash.hex()} "
-                        f"for safe={safe.address} was already executed in "
+                        f"for safe={safe_address} was already executed in "
                         f"tx-hash={multisig_transaction.ethereum_tx_id}"
                     )
 
             raise ValidationError(
-                f"Tx with nonce={safe_tx.safe_nonce} for safe={safe.address} "
+                f"Tx with nonce={safe_tx.safe_nonce} for safe={safe_address} "
                 f"already executed in tx-hash={multisig_transactions[0].ethereum_tx_id}"
             )
 
-        # Check owners and pending owners
-        try:
-            safe_owners = safe.retrieve_owners(block_identifier="pending")
-        except BadFunctionCallOutput:  # Error using pending block identifier
-            safe_owners = safe.retrieve_owners(block_identifier="latest")
-        except IOError:
-            raise ValidationError(
-                "Problem connecting to the ethereum node, please try again later"
-            )
-
-        data["safe_owners"] = safe_owners
+        safe_owners = get_safe_owners(safe_address)
+        attrs["safe_owners"] = safe_owners
 
         delegates = SafeContractDelegate.objects.get_delegates_for_safe_and_owners(
-            safe.address, safe_owners
+            safe_address, safe_owners
         )
         allowed_senders = set(safe_owners) | delegates
-        if not data["sender"] in allowed_senders:
+        if not attrs["sender"] in allowed_senders:
             raise ValidationError(
-                f'Sender={data["sender"]} is not an owner or delegate. '
+                f'Sender={attrs["sender"]} is not an owner or delegate. '
                 f"Current owners={safe_owners}. Delegates={delegates}"
             )
 
         signature_owners = []
         # TODO Make signature mandatory
-        signature = data.get("signature", b"")
+        signature = attrs.get("signature", b"")
         parsed_signatures = SafeSignature.parse_signature(
             signature, contract_transaction_hash
         )
-        data["parsed_signatures"] = parsed_signatures
+        attrs["parsed_signatures"] = parsed_signatures
         # If there's at least one signature, transaction is trusted (until signatures are mandatory)
-        data["trusted"] = bool(parsed_signatures)
+        attrs["trusted"] = bool(parsed_signatures)
         for safe_signature in parsed_signatures:
             owner = safe_signature.owner
-            if not safe_signature.is_valid(ethereum_client, safe.address):
+            if not safe_signature.is_valid(ethereum_client, safe_address):
                 raise ValidationError(
                     f"Signature={safe_signature.signature.hex()} for owner={owner} is not valid"
                 )
@@ -247,13 +237,13 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializerV1):
             signature_owners.append(owner)
 
         # TODO Make signature mandatory. len(signature_owners) must be >= 1
-        if signature_owners and data["sender"] not in signature_owners:
+        if signature_owners and attrs["sender"] not in signature_owners:
             raise ValidationError(
-                f'Signature does not match sender={data["sender"]}. '
+                f'Signature does not match sender={attrs["sender"]}. '
                 f"Calculated owners={signature_owners}"
             )
 
-        return data
+        return attrs
 
     def save(self, **kwargs):
         safe_tx_hash = self.validated_data["contract_transaction_hash"]
@@ -296,7 +286,7 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializerV1):
 
         for safe_signature in self.validated_data.get("parsed_signatures"):
             if safe_signature.owner in self.validated_data["safe_owners"]:
-                multisig_confirmation, _ = MultisigConfirmation.objects.get_or_create(
+                MultisigConfirmation.objects.get_or_create(
                     multisig_transaction_hash=safe_tx_hash,
                     owner=safe_signature.owner,
                     defaults={
@@ -385,19 +375,10 @@ class DelegateSerializer(DelegateSignatureCheckerMixin, serializers.Serializer):
     signature = HexadecimalField(min_length=65)
     label = serializers.CharField(max_length=50)
 
-    def get_safe_owners(
-        self, ethereum_client: EthereumClient, safe_address: ChecksumAddress
-    ) -> List[ChecksumAddress]:
-        safe = Safe(safe_address, ethereum_client)
-        try:
-            return safe.retrieve_owners(block_identifier="pending")
-        except BadFunctionCallOutput:  # Error using pending block identifier
-            return safe.retrieve_owners(block_identifier="latest")
+    def validate(self, attrs):
+        super().validate(attrs)
 
-    def validate(self, data):
-        super().validate(data)
-
-        safe_address: Optional[ChecksumAddress] = data.get("safe")
+        safe_address: Optional[ChecksumAddress] = attrs.get("safe")
         if (
             safe_address
             and not SafeContract.objects.filter(address=safe_address).exists()
@@ -406,16 +387,16 @@ class DelegateSerializer(DelegateSignatureCheckerMixin, serializers.Serializer):
                 f"Safe={safe_address} does not exist or it's still not indexed"
             )
 
-        signature = data["signature"]
-        delegate = data["delegate"]  # Delegate address to be added/removed
-        delegator = data[
+        signature = attrs["signature"]
+        delegate = attrs["delegate"]  # Delegate address to be added/removed
+        delegator = attrs[
             "delegator"
         ]  # Delegator giving permissions to delegate (signer)
 
         ethereum_client = EthereumClientProvider()
         if safe_address:
             # Valid delegators must be owners
-            valid_delegators = self.get_safe_owners(ethereum_client, safe_address)
+            valid_delegators = get_safe_owners(safe_address)
             if delegator not in valid_delegators:
                 raise ValidationError(
                     f"Provided delegator={delegator} is not an owner of Safe={safe_address}"
@@ -428,7 +409,7 @@ class DelegateSerializer(DelegateSignatureCheckerMixin, serializers.Serializer):
             if self.check_delegate_signature(
                 ethereum_client, signature, operation_hash, delegator
             ):
-                return data
+                return attrs
 
         raise ValidationError(
             f"Signature does not match provided delegator={delegator}"
@@ -455,12 +436,12 @@ class DelegateDeleteSerializer(DelegateSignatureCheckerMixin, serializers.Serial
     delegator = EthereumAddressField()
     signature = HexadecimalField(min_length=65)
 
-    def validate(self, data):
-        super().validate(data)
+    def validate(self, attrs):
+        super().validate(attrs)
 
-        signature = data["signature"]
-        delegate = data["delegate"]  # Delegate address to be added/removed
-        delegator = data["delegator"]  # Delegator
+        signature = attrs["signature"]
+        delegate = attrs["delegate"]  # Delegate address to be added/removed
+        delegator = attrs["delegator"]  # Delegator
 
         ethereum_client = EthereumClientProvider()
         # Tries to find a valid delegator using multiple strategies
@@ -471,7 +452,7 @@ class DelegateDeleteSerializer(DelegateSignatureCheckerMixin, serializers.Serial
                 if self.check_delegate_signature(
                     ethereum_client, signature, operation_hash, signer
                 ):
-                    return data
+                    return attrs
 
         raise ValidationError(
             f"Signature does not match provided delegate={delegate} or delegator={delegator}"
@@ -564,9 +545,11 @@ class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializerV1):
     is_successful = serializers.SerializerMethodField()
     gas_price = serializers.CharField()
     eth_gas_price = serializers.SerializerMethodField()
+    max_fee_per_gas = serializers.SerializerMethodField()
+    max_priority_fee_per_gas = serializers.SerializerMethodField()
     gas_used = serializers.SerializerMethodField()
     fee = serializers.SerializerMethodField()
-    origin = serializers.CharField()
+    origin = serializers.SerializerMethodField()
     data_decoded = serializers.SerializerMethodField()
     confirmations_required = serializers.IntegerField()
     confirmations = serializers.SerializerMethodField()
@@ -603,15 +586,23 @@ class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializerV1):
         if obj.ethereum_tx and obj.ethereum_tx.gas_price:
             return str(obj.ethereum_tx.gas_price)
 
+    def get_max_fee_per_gas(self, obj: MultisigTransaction) -> Optional[str]:
+        if obj.ethereum_tx and obj.ethereum_tx.max_fee_per_gas:
+            return str(obj.ethereum_tx.max_fee_per_gas)
+
+    def get_max_priority_fee_per_gas(self, obj: MultisigTransaction) -> Optional[str]:
+        if obj.ethereum_tx and obj.ethereum_tx.max_priority_fee_per_gas:
+            return str(obj.ethereum_tx.max_priority_fee_per_gas)
+
     def get_gas_used(self, obj: MultisigTransaction) -> Optional[int]:
         if obj.ethereum_tx and obj.ethereum_tx.gas_used:
             return obj.ethereum_tx.gas_used
 
     def get_is_successful(self, obj: MultisigTransaction) -> Optional[bool]:
-        if obj.failed is None:
-            return None
-        else:
-            return not obj.failed
+        return None if obj.failed is None else not obj.failed
+
+    def get_origin(self, obj: MultisigTransaction) -> str:
+        return obj.origin if isinstance(obj.origin, str) else json.dumps(obj.origin)
 
     def get_data_decoded(self, obj: MultisigTransaction) -> Dict[str, Any]:
         # If delegate call contract must be whitelisted (security)
@@ -619,6 +610,21 @@ class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializerV1):
             return get_data_decoded_from_data(
                 obj.data.tobytes() if obj.data else b"", address=obj.to
             )
+
+
+class IndexingStatusSerializer(serializers.Serializer):
+    current_block_number = serializers.IntegerField()
+    erc20_block_number = serializers.IntegerField()
+    erc20_synced = serializers.BooleanField()
+    master_copies_block_number = serializers.IntegerField()
+    master_copies_synced = serializers.BooleanField()
+    synced = serializers.BooleanField()
+
+
+class ERC20IndexingStatusSerializer(serializers.Serializer):
+    current_block_number = serializers.IntegerField()
+    erc20_block_number = serializers.IntegerField()
+    erc20_synced = serializers.BooleanField()
 
 
 class Erc20InfoSerializer(serializers.Serializer):
@@ -688,7 +694,7 @@ class SafeInfoResponseSerializer(serializers.Serializer):
     modules = serializers.ListField(child=EthereumAddressField())
     fallback_handler = EthereumAddressField()
     guard = EthereumAddressField()
-    version = serializers.CharField()
+    version = serializers.CharField(allow_null=True)
 
 
 class MasterCopyResponseSerializer(serializers.Serializer):
@@ -698,6 +704,10 @@ class MasterCopyResponseSerializer(serializers.Serializer):
     deployed_block_number = serializers.IntegerField(source="initial_block_number")
     last_indexed_block_number = serializers.IntegerField(source="tx_block_number")
     l2 = serializers.BooleanField()
+
+
+class ModulesResponseSerializer(serializers.Serializer):
+    safes = serializers.ListField(child=EthereumAddressField())
 
 
 class OwnerResponseSerializer(serializers.Serializer):
@@ -735,16 +745,15 @@ class TransferResponseSerializer(serializers.Serializer):
         else:
             if obj["_value"] is not None:
                 return TransferType.ERC20_TRANSFER.name
-            elif obj["_token_id"] is not None:
+            if obj["_token_id"] is not None:
                 return TransferType.ERC721_TRANSFER.name
-            else:
-                return TransferType.UNKNOWN.name
+            return TransferType.UNKNOWN.name
 
-    def validate(self, data):
-        super().validate(data)
-        if data["value"] is None and data["token_id"] is None:
+    def validate(self, attrs):
+        super().validate(attrs)
+        if attrs["value"] is None and attrs["token_id"] is None:
             raise ValidationError("Both value and token_id cannot be null")
-        return data
+        return attrs
 
 
 class TransferWithTokenInfoResponseSerializer(TransferResponseSerializer):
@@ -849,17 +858,6 @@ class EthereumTxWithTransfersResponseSerializer(serializers.Serializer):
             return obj.block_id
 
 
-class AnalyticsMultisigTxsByOriginResponseSerializer(serializers.Serializer):
-    origin = serializers.CharField()
-    transactions = serializers.IntegerField()
-
-
-class AnalyticsMultisigTxsBySafeResponseSerializer(serializers.Serializer):
-    safe = EthereumAddressField()
-    master_copy = EthereumAddressField()
-    transactions = serializers.IntegerField()
-
-
 class AllTransactionsSchemaSerializer(serializers.Serializer):
     """
     Just for the purpose of documenting, don't use it
@@ -882,15 +880,6 @@ class SafeDelegateDeleteSerializer(serializers.Serializer):
     delegate = EthereumAddressField()
     signature = HexadecimalField(min_length=65)
 
-    def get_safe_owners(
-        self, ethereum_client: EthereumClient, safe_address: ChecksumAddress
-    ) -> List[ChecksumAddress]:
-        safe = Safe(safe_address, ethereum_client)
-        try:
-            return safe.retrieve_owners(block_identifier="pending")
-        except BadFunctionCallOutput:  # Error using pending block identifier
-            return safe.retrieve_owners(block_identifier="latest")
-
     def get_valid_delegators(
         self,
         ethereum_client: EthereumClient,
@@ -903,7 +892,7 @@ class SafeDelegateDeleteSerializer(serializers.Serializer):
         :param delegate:
         :return: Valid delegators for a Safe. A delegate should be able to remove itself
         """
-        return self.get_safe_owners(ethereum_client, safe_address) + [delegate]
+        return get_safe_owners(safe_address) + [delegate]
 
     def check_signature(
         self,
@@ -942,17 +931,17 @@ class SafeDelegateDeleteSerializer(serializers.Serializer):
                 )
             return delegator
 
-    def validate(self, data):
-        super().validate(data)
+    def validate(self, attrs):
+        super().validate(attrs)
 
-        safe_address = data["safe"]
+        safe_address = attrs["safe"]
         if not SafeContract.objects.filter(address=safe_address).exists():
             raise ValidationError(
                 f"Safe={safe_address} does not exist or it's still not indexed"
             )
 
-        signature = data["signature"]
-        delegate = data["delegate"]  # Delegate address to be added/removed
+        signature = attrs["signature"]
+        delegate = attrs["delegate"]  # Delegate address to be added/removed
 
         ethereum_client = EthereumClientProvider()
         valid_delegators = self.get_valid_delegators(
@@ -976,8 +965,8 @@ class SafeDelegateDeleteSerializer(serializers.Serializer):
         if not delegator:
             raise ValidationError("Signing owner is not an owner of the Safe")
 
-        data["delegator"] = delegator
-        return data
+        attrs["delegator"] = delegator
+        return attrs
 
 
 class SafeDelegateSerializer(SafeDelegateDeleteSerializer):
@@ -999,7 +988,7 @@ class SafeDelegateSerializer(SafeDelegateDeleteSerializer):
         :param delegate:
         :return: Valid delegators for a Safe. A delegate shouldn't be able to add itself
         """
-        return self.get_safe_owners(ethereum_client, safe_address)
+        return get_safe_owners(safe_address)
 
     def save(self, **kwargs):
         safe_address = self.validated_data["safe"]

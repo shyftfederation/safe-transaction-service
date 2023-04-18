@@ -15,9 +15,7 @@ from botocore.exceptions import ClientError
 from cachetools import TTLCache, cachedmethod
 from imagekit.models import ProcessedImageField
 from pilkit.processors import Resize
-from web3 import Web3
 from web3._utils.normalizers import normalize_abi
-from web3.contract import Contract
 
 from gnosis.eth.clients import (
     BlockscoutClient,
@@ -28,6 +26,7 @@ from gnosis.eth.clients import (
 )
 from gnosis.eth.django.models import EthereumAddressV2Field, Keccak256Field
 from gnosis.eth.ethereum_client import EthereumClientProvider, EthereumNetwork
+from gnosis.eth.utils import fast_keccak
 
 logger = getLogger(__name__)
 
@@ -56,7 +55,7 @@ def validate_abi(value: Dict[str, Any]):
         raise ValidationError(
             _("%(value)s is not a valid Ethereum Contract ABI: %(reason)s"),
             params={"value": value, "reason": str(exc)},
-        )
+        ) from exc
 
 
 class ContractAbi(models.Model):
@@ -84,7 +83,9 @@ class ContractAbi(models.Model):
                 update_fields.append("abi_hash")
         if isinstance(self.abi, str):
             self.abi = json.loads(self.abi)
-        self.abi_hash = Web3.keccak(text=json.dumps(self.abi, separators=(",", ":")))
+        self.abi_hash = fast_keccak(
+            json.dumps(self.abi, separators=(",", ":")).encode()
+        )
         try:
             # ABI already exists, overwrite
             contract_abi = self.__class__.objects.get(abi_hash=self.abi_hash)
@@ -98,7 +99,7 @@ class ContractAbi(models.Model):
 class ContractManager(models.Manager):
     def create_from_address(
         self, address: str, network: Optional[EthereumNetwork] = None
-    ) -> Contract:
+    ) -> "Contract":
         """
         Create contract and try to fetch information from APIs
 
@@ -186,7 +187,8 @@ class Contract(models.Model):  # Known contract addresses by the service
 
     def sync_abi_from_api(self, network: Optional[EthereumNetwork] = None) -> bool:
         """
-        Sync ABI from Sourcify, then from Etherscan and blockscout if available
+        Sync ABI from Sourcify, then from Etherscan and Blockscout if available
+
         :param network: Can be provided to save requests to the node
         :return: True if updated, False otherwise
         """

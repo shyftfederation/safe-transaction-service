@@ -27,6 +27,7 @@ from ..models import (
     ProxyFactory,
     SafeContract,
     SafeContractDelegate,
+    SafeLastStatus,
     SafeMasterCopy,
     SafeStatus,
     TokenTransfer,
@@ -57,11 +58,14 @@ class EthereumTxFactory(DjangoModelFactory):
     _from = factory.LazyFunction(lambda: Account.create().address)
     gas = factory.fuzzy.FuzzyInteger(1000, 5000)
     gas_price = factory.fuzzy.FuzzyInteger(1, 100)
+    max_fee_per_gas = None
+    max_priority_fee_per_gas = None
     data = factory.Sequence(lambda n: HexBytes("%x" % (n + 1000)))
     nonce = factory.Sequence(lambda n: n)
     to = factory.LazyFunction(lambda: Account.create().address)
     value = factory.fuzzy.FuzzyInteger(0, 1000)
     logs = factory.LazyFunction(lambda: [])
+    type = 0
 
 
 class TokenTransfer(DjangoModelFactory):
@@ -111,7 +115,7 @@ class InternalTxFactory(DjangoModelFactory):
     refund_address = NULL_ADDRESS
     tx_type = InternalTxType.CALL.value
     call_type = EthereumTxCallType.CALL.value
-    trace_address = factory.Sequence(lambda n: str(n))
+    trace_address = factory.Sequence(str)
     error = None
 
 
@@ -262,7 +266,6 @@ class SafeContractFactory(DjangoModelFactory):
 
     address = factory.LazyFunction(lambda: Account.create().address)
     ethereum_tx = factory.SubFactory(EthereumTxFactory)
-    erc20_block_number = factory.LazyFunction(lambda: 0)
 
 
 class SafeContractDelegateFactory(DjangoModelFactory):
@@ -297,9 +300,9 @@ class SafeMasterCopyFactory(MonitoredAddressFactory):
         model = SafeMasterCopy
 
 
-class SafeStatusFactory(DjangoModelFactory):
+class SafeLastStatusFactory(DjangoModelFactory):
     class Meta:
-        model = SafeStatus
+        model = SafeLastStatus
 
     internal_tx = factory.SubFactory(InternalTxFactory)
     address = factory.LazyFunction(lambda: Account.create().address)
@@ -312,6 +315,11 @@ class SafeStatusFactory(DjangoModelFactory):
     enabled_modules = []
 
 
+class SafeStatusFactory(SafeLastStatusFactory):
+    class Meta:
+        model = SafeStatus
+
+
 class WebHookFactory(DjangoModelFactory):
     class Meta:
         model = WebHook
@@ -320,7 +328,7 @@ class WebHookFactory(DjangoModelFactory):
     url = factory.Sequence(lambda n: f"http://localhost/test/{n}")
     # Configurable webhook types to listen to
     new_confirmation = True
-    pending_outgoing_transaction = True
-    new_executed_outgoing_transaction = True
+    pending_multisig_transaction = True
+    new_executed_multisig_transaction = True
     new_incoming_transaction = True
     authorization = None

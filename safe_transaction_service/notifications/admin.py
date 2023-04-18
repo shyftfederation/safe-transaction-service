@@ -2,7 +2,7 @@ from typing import List
 
 from django.contrib import admin
 
-from safe_transaction_service.utils.admin import BinarySearchAdmin
+from gnosis.eth.django.admin import BinarySearchAdmin
 
 from .models import FirebaseDevice, FirebaseDeviceOwner
 
@@ -37,4 +37,4 @@ class FirebaseDeviceAdmin(BinarySearchAdmin):
 class FirebaseDeviceOwnerAdmin(BinarySearchAdmin):
     list_display = ("firebase_device_id", "owner")
     ordering = ["firebase_device_id"]
-    search_fields = ["firebase_device_id", "=owner"]
+    search_fields = ["firebase_device_id__uuid", "=owner"]

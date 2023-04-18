@@ -13,9 +13,10 @@ from gnosis.eth.django.serializers import EthereumAddressField, HexadecimalField
 from gnosis.safe.safe_signature import SafeSignature, SafeSignatureType
 
 from safe_transaction_service.history.models import SafeContract, SafeContractDelegate
+from safe_transaction_service.utils.serializers import get_safe_owners
 
 from .models import DeviceTypeEnum, FirebaseDevice, FirebaseDeviceOwner
-from .utils import calculate_device_registration_hash, get_safe_owners
+from .utils import calculate_device_registration_hash
 
 
 class FirebaseDeviceSerializer(serializers.Serializer):
@@ -87,20 +88,20 @@ class FirebaseDeviceSerializer(serializers.Serializer):
 
         return valid_owners
 
-    def validate(self, data: Dict[str, Any]):
-        data = super().validate(data)
+    def validate(self, attrs: Dict[str, Any]):
+        attrs = super().validate(attrs)
         signature_owners = []
         owners_without_safe = []
-        signatures = data.get("signatures") or []
-        safe_addresses = data["safes"]
+        signatures = attrs.get("signatures") or []
+        safe_addresses = attrs["safes"]
         if signatures:
             valid_owners = self.get_valid_owners(safe_addresses)
             for signature in signatures:
                 hash_to_sign = calculate_device_registration_hash(
-                    data["timestamp"],
-                    data["uuid"],
-                    data["cloud_messaging_token"],
-                    data["safes"],
+                    attrs["timestamp"],
+                    attrs["uuid"],
+                    attrs["cloud_messaging_token"],
+                    attrs["safes"],
                 )
                 parsed_signatures = SafeSignature.parse_signature(
                     signature, hash_to_sign
@@ -132,9 +133,9 @@ class FirebaseDeviceSerializer(serializers.Serializer):
                     "Number of signatures is less than the number of owners detected"
                 )
 
-        data["owners_registered"] = signature_owners
-        data["owners_not_registered"] = owners_without_safe
-        return data
+        attrs["owners_registered"] = signature_owners
+        attrs["owners_not_registered"] = owners_without_safe
+        return attrs
 
     @transaction.atomic
     def save(self, **kwargs):

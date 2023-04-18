@@ -20,14 +20,9 @@ urlpatterns = [
         "about/master-copies/", views.MasterCopiesView.as_view(), name="master-copies"
     ),
     path(
-        "analytics/multisig-transactions/by-safe/",
-        views.AnalyticsMultisigTxsBySafeListView.as_view(),
-        name="analytics-multisig-txs-by-safe",
-    ),
-    path(
-        "analytics/multisig-transactions/by-origin/",
-        views.AnalyticsMultisigTxsByOriginListView.as_view(),
-        name="analytics-multisig-txs-by-origin",
+        "about/indexing/",
+        views.IndexingView.as_view(),
+        name="indexing",
     ),
     path("data-decoder/", views.DataDecoderView.as_view(), name="data-decoder"),
     path("delegates/", views.DelegateListView.as_view(), name="delegates"),
@@ -88,11 +83,6 @@ urlpatterns = [
         name="safe-balances-usd",
     ),
     path(
-        "safes/<str:address>/collectibles/",
-        views.SafeCollectiblesView.as_view(),
-        name="safe-collectibles",
-    ),
-    path(
         "safes/<str:address>/delegates/",
         views.SafeDelegateListView.as_view(),
         name="safe-delegates",
@@ -112,6 +102,7 @@ urlpatterns = [
         views.SafeMultisigConfirmationsView.as_view(),
         name="multisig-transaction-confirmations",
     ),
+    path("modules/<str:address>/safes/", views.ModulesView.as_view(), name="modules"),
     path("owners/<str:address>/safes/", views.OwnersView.as_view(), name="owners"),
     path(
         "transactions/<str:safe_tx_hash>/",
